@@ -5,7 +5,7 @@ A lightweight wrapper server built on top of `mlx_lm`, specifically designed for
 This repository aims to save you time and tokens by solving typical local agent pain points (such as broken tool calls, runaway model reasoning loops, and VRAM thrashing).
 
 Tested with `mlx_lm` version 0.31.3 and `Goose` version 1.45.0. 
-This wrapper might also be relevant and adaptable for clients other than Goose.
+This wrapper may also be useful for clients other than Goose or for other models.
 
 ---
 

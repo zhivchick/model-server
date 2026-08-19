@@ -1,11 +1,10 @@
-# goose_hooks.py
 import logging
 import json
 
 logger = logging.getLogger("goose_server.hooks")
 
 def convert_openai_to_hf_tool(openai_tool: dict) -> dict:
-    """Конвертирует формат описания инструментов в формат Hugging Face."""
+    """Converts the tool description format from OpenAI to Hugging Face standard."""
     if not isinstance(openai_tool, dict) or "function" not in openai_tool:
         return openai_tool
     func = openai_tool["function"]
@@ -26,7 +25,7 @@ def convert_openai_to_hf_tool(openai_tool: dict) -> dict:
     return hf_tool
 
 def apply_pre_call_hooks(body: dict) -> tuple:
-    """Нормализует сообщения и жестко, всегда отключает рассуждения модели."""
+    """Normalizes messages layout and strictly deactivates model reasoning layers."""
     messages = body.get("messages", [])
     tools = body.get("tools", None)
     
@@ -66,7 +65,7 @@ def apply_pre_call_hooks(body: dict) -> tuple:
         if not has_user or fixed_messages[-1].get("role") == "tool":
             fixed_messages.append({"role": "user", "content": "Continue and execute the next tool step based on the output above."})
 
-    # 🎯 ВСЕГДА И НАМЕРТВО ПЕРЕДАЕМ ДЕАКТИВАЦИЮ THINKING НА ВСЕ УРОВНИ ШАБЛОНА
+    # 🎯 Enforce reasoning suppression across all template layout arguments
     template_kwargs = {
         "tokenize": False,
         "add_generation_prompt": True,
@@ -78,7 +77,6 @@ def apply_pre_call_hooks(body: dict) -> tuple:
         }
     }
     
-    # Инструменты дописываются параллельно, никак не влияя на Banned-флаги мыслей
     if tools is not None:
         template_kwargs["tools"] = [convert_openai_to_hf_tool(t) for t in tools if isinstance(t, dict)]
 

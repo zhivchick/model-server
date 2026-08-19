@@ -1,10 +1,9 @@
-# response_formatters.py
 import json
 import time
 import uuid
 
 def build_streaming_chunk(request_id: str, model_name: str, content: str = None, tool_name: str = None, tool_args: str = None, finish_reason: str = None, prompt_len: int = 0, completion_len: int = 0) -> str:
-    """Формирует чанк Server-Sent Events (SSE) с поддержкой OpenAI Usage для Goose."""
+    """Constructs a Server-Sent Events (SSE) chunk containing OpenAI Usage metadata for Goose tracking."""
     delta = {}
     if tool_name:
         delta = {
@@ -31,7 +30,7 @@ def build_streaming_chunk(request_id: str, model_name: str, content: str = None,
         }]
     }
 
-    # 🎯 ОЖИВЛЯЕМ ТРЕКЕР GOOSE: Если стрим завершается, принудительно прокидываем usage объект
+    # 🎯 Force injection of usage metrics on terminal stream chunks to sync the Goose token tracker
     if finish_reason in ["stop", "tool_calls"] and prompt_len > 0:
         chunk["usage"] = {
             "prompt_tokens": prompt_len,
@@ -42,6 +41,7 @@ def build_streaming_chunk(request_id: str, model_name: str, content: str = None,
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 def build_monolithic_response(text: str, model_name: str, tool_name: str = None, tool_args: str = None) -> dict:
+    """Builds a non-streaming, monolithic OpenAI-compliant chat completion object response."""
     choices = []
     if tool_name:
         choices.append({
