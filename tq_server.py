@@ -1,4 +1,3 @@
-# tq_server.py
 import uuid
 import argparse
 import logging
@@ -13,7 +12,7 @@ from stream_bridge import async_queue_bridge
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger("mlx_lm_server")
 
-parser = argparse.ArgumentParser(description="Stateful MLX OpenAI Server")
+parser = argparse.ArgumentParser(description="Stateful Multi-Session MLX Server")
 parser.add_argument("--model", type=str, required=True)
 parser.add_argument("--host", type=str, default="127.0.0.1")
 parser.add_argument("--port", type=int, default=8080)
@@ -34,72 +33,93 @@ def make_persistent_cache():
     from mlx_lm.models.base import create_kv_cache
     return create_kv_cache(model)
 
-GLOBAL_PROMPT_CACHE = make_persistent_cache()
-PREVIOUS_PROMPT_STRING = ""
+# 🎯 Изолированные сессии во VRAM (Агент против системных утилит)
+GLOBAL_CACHE_REGISTRY = {
+    "agent": make_persistent_cache(),
+    "utility": make_persistent_cache()
+}
 
-print("\n" + "="*60 + "\n🚀 [Goose Stateful Server] Успешно запущен!\n💡 Архитектура: Модульные слои + Алгоритм Общего Префикса LCP\n" + "="*60 + "\n")
+# 🎯 Хранилище токенизированной истории для защиты от разрыва слов
+PREVIOUS_IDS_REGISTRY = {
+    "agent": [],
+    "utility": []
+}
+
+print("\n" + "="*60 + "\n🚀 [Goose Stateful Server] Успешно запущен!\n💡 Архитектура: Раздельные Кэш-Сессии VRAM (Apple Style)\n" + "="*60 + "\n")
 app = FastAPI()
 
-def find_longest_common_prefix(s1: str, str2: str) -> int:
-    """Возвращает длину наибольшего общего префикса между двумя строками."""
-    min_len = min(len(s1), len(str2))
+def find_longest_common_token_prefix(list1: list, list2: list) -> int:
+    """Вычисляет длину общего префикса строго по ID токенов."""
+    min_len = min(len(list1), len(list2))
     for i in range(min_len):
-        if s1[i] != str2[i]:
+        if list1[i] != list2[i]:
             return i
     return min_len
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    global GLOBAL_PROMPT_CACHE, PREVIOUS_PROMPT_STRING
+    global GLOBAL_CACHE_REGISTRY, PREVIOUS_IDS_REGISTRY
     body = await request.json()
     max_tokens = body.get("max_tokens", args.max_tokens)
     request_id = f"chatcmpl-{uuid.uuid4()}"
     
-    logger.info(f"POST /v1/chat/completions")
     fixed_messages, template_kwargs = apply_pre_call_hooks(body)
     has_tools = body.get("tools") is not None
-
-    # Генерируем полную текстовую строку промпта для текущего шага
-    full_prompt_string = tokenizer.apply_chat_template(fixed_messages, **template_kwargs)
+    session_key = "agent" if has_tools else "utility"
     
-    # 🎯 ВЫЧИСЛЯЕМ МАКСИМАЛЬНОЕ СОВПАДЕНИЕ ТЕКСТА (LCP АЛГОРИТМ):
-    if PREVIOUS_PROMPT_STRING:
-        prefix_len = find_longest_common_prefix(PREVIOUS_PROMPT_STRING, full_prompt_string)
+    # Честная полная токенизация всей строки
+    full_prompt_string = tokenizer.apply_chat_template(fixed_messages, **template_kwargs)
+    current_prompt_ids = tokenizer.encode(full_prompt_string)
+    total_prompt_len = len(current_prompt_ids)
+
+    logger.info(f"POST /v1/chat/completions | Роль сессии: [{session_key.upper()}] (ID: {request_id})")
+
+    prev_ids = PREVIOUS_IDS_REGISTRY[session_key]
+    active_cache = GLOBAL_CACHE_REGISTRY[session_key]
+    
+    # Проверка Cache Hit на уровне числовых токенов
+    if prev_ids:
+        matched_tokens_len = find_longest_common_token_prefix(prev_ids, current_prompt_ids)
         
-        # Если совпало больше 1000 символов (это гарантированно наша история диалога)
-        if prefix_len > 1000:
-            # Извлекаем кусок текста, который совпал символ-в-символ
-            matched_text = full_prompt_string[:prefix_len]
-            # Извлекаем только свежий хвост, который изменился или добавился
-            new_text_chunk = full_prompt_string[prefix_len:]
+        # Минимальный порог вхождения в кэш (чтобы не дергать сдвиги ради 5 токенов)
+        if matched_tokens_len > 300:
+            prompt_ids_chunk = current_prompt_ids[matched_tokens_len:]
             
-            # Переводим в токены оба куска, чтобы узнать точное смещение для Си-ядра Apple
-            matched_tokens_len = len(tokenizer.encode(matched_text))
-            prompt_ids_chunk = tokenizer.encode(new_text_chunk)
-            
-            # Сдвигаем счетчик позиций внутри слоев глобального кэша Metal VRAM.
-            # Мы принудительно обрезаем кэш до длины совпавших токенов!
-            for layer_cache in GLOBAL_PROMPT_CACHE:
+            # Апдейтим смещение Apple Metal слоев
+            for layer_cache in active_cache:
                 if hasattr(layer_cache, "offset"):
                     layer_cache.offset = matched_tokens_len
+                elif hasattr(layer_cache, "step"):
+                    layer_cache.step = matched_tokens_len
             
-            logger.info(f"🎯 [Cache LCP Hit] Совпало {matched_tokens_len} токенов истории! Сдвигаем offset.")
-            logger.info(f"Evaluating ONLY incremental diff: {len(prompt_ids_chunk)} tokens.")
+            logger.info(f"🎯 [Cache {session_key.upper()} Hit] Совпало: {matched_tokens_len} токенов. Дорасчет: {len(prompt_ids_chunk)} токенов.")
+            PREVIOUS_IDS_REGISTRY[session_key] = current_prompt_ids
             
-            PREVIOUS_PROMPT_STRING = full_prompt_string
             return StreamingResponse(
-                async_queue_bridge(model, tokenizer, prompt_ids_chunk, max_tokens, request_id, has_tools, args.prefill_step_size, GLOBAL_PROMPT_CACHE, args.model),
+                async_queue_bridge(
+                    model, tokenizer, prompt_ids_chunk, max_tokens, request_id, has_tools, 
+                    args.prefill_step_size, active_cache, args.model, 
+                    prompt_tokens_len=total_prompt_len  # 🎯 Простая сумма: совпавшее + новое
+                ),
                 media_type="text/event-stream"
             )
 
-    # Fallback: Если это старт новой сессии Goose
-    logger.info("🧹 [Cache Miss] Новая сессия. Инициализируем полный префилл.")
-    GLOBAL_PROMPT_CACHE = make_persistent_cache()
-    PREVIOUS_PROMPT_STRING = full_prompt_string
-    full_prompt_ids = tokenizer.encode(full_prompt_string)
+    # Ветка Cache Miss
+    if len(fixed_messages) <= 2:
+        logger.info(f"🧹 [Cache {session_key.upper()} Reset] Старт новой задачи [{session_key}]. Буфер очищен.")
+    else:
+        logger.info(f"🧹 [Cache {session_key.upper()} Miss] Сбой префикса сессии [{session_key}]. Полный пересчет {total_prompt_len} токенов.")
+        
+    active_cache = make_persistent_cache()
+    GLOBAL_CACHE_REGISTRY[session_key] = active_cache
+    PREVIOUS_IDS_REGISTRY[session_key] = current_prompt_ids
     
     return StreamingResponse(
-        async_queue_bridge(model, tokenizer, full_prompt_ids, max_tokens, request_id, has_tools, args.prefill_step_size, GLOBAL_PROMPT_CACHE, args.model),
+        async_queue_bridge(
+            model, tokenizer, current_prompt_ids, max_tokens, request_id, has_tools, 
+            args.prefill_step_size, active_cache, args.model, 
+            prompt_tokens_len=total_prompt_len  # 🎯 Передаем честный полный размер
+        ),
         media_type="text/event-stream"
     )
 
