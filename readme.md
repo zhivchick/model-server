@@ -44,16 +44,18 @@ This wrapper may also be useful for clients other than Goose or for other models
 
 ### 1. Installation
 
-Install the server prerequisites along with the verified working baseline versions of `mlx-lm` and the `goose` engine:
+Install the server prerequisites
 
 ```bash
 # Install core server dependencies
 pip install fastapi uvicorn starlette
 ```
 
+along with the verified working baseline versions of `mlx-lm` and the `goose` engine.
+
 ### 2. Usage
 
-Run the stateful backend server pointing to your local 4-bit Qwen model path with optimized context boundaries and prefill step tuning:
+Run the backend server pointing to your local model path with optimized context boundaries and prefill step tuning:
 
 ```bash
 python tq_server.py \
