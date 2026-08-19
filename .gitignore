@@ -1,0 +1,32 @@
+# Python bytecode and caching files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# Environments and Virtual Directories
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs and Text Editors configuration
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Local MLX Weight Files and Model Downloads
+# (Prevents accidentally pushing gigabytes of weights to GitHub)
+mlx_models/
+*.bin
+*.safetensors
+*.gguf
+
+# Logging outputs
+*.log
