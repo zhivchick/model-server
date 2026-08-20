@@ -86,6 +86,13 @@ async def chat_completions(request: Request):
         if matched_tokens_len > 300:
             prompt_ids_chunk = current_prompt_ids[matched_tokens_len:]
             
+            # 🎯 FIX FOR 100% CACHE HIT (0 tokens delta error):
+            # If there are no new tokens, steal the last token from the cache to trigger MLX generator properly
+            if len(prompt_ids_chunk) == 0:
+                matched_tokens_len -= 1
+                prompt_ids_chunk = [current_prompt_ids[-1]]
+                logger.info("⚠️ 100% Cache Hit detected (0 new tokens). Adjusting cache offset by -1 to trigger generation.")
+            
             # Sync C++ level hardware execution offsets across Apple Metal context cache layers
             for layer_cache in active_cache:
                 if hasattr(layer_cache, "offset"):
@@ -95,6 +102,7 @@ async def chat_completions(request: Request):
             
             logger.info(f"🎯 [Cache {session_key.upper()} Hit] Reused context: {matched_tokens_len} tokens. Evaluating delta remainder: {len(prompt_ids_chunk)} tokens.")
             PREVIOUS_IDS_REGISTRY[session_key] = current_prompt_ids
+
             
             return StreamingResponse(
                 async_queue_bridge(

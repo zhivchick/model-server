@@ -61,6 +61,10 @@ def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id,
     """Background worker with absolute GPU thread isolation and token streaming."""
     global GPU_THREAD_LOCK
     GPU_THREAD_LOCK.acquire()
+
+    # 🎯 FIX FOR MULTI-THREADED METAL STREAMS IN MLX:
+    # Explicitly bind the current CPU thread to the default Apple Silicon GPU device/stream context
+    mx.set_default_device(mx.gpu)
     
     is_utility = not has_tools
     _log_stream_start(request_id, is_utility, prompt_tokens_len)
