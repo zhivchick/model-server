@@ -10,11 +10,14 @@ from mlx_lm.generate import stream_generate
 from response_formatters import build_streaming_chunk
 from qwen_xml_parser import QwenXmlParser
 
+# Import sub-modules logic blocks
+from perf_tracker import perf_tracker
+from anti_loop import anti_loop_engine
+
 logger = logging.getLogger("mlx_lm_server.bridge")
 GPU_THREAD_LOCK = threading.Lock()
 
 def _log_stream_start(request_id: str, is_utility: bool, prompt_len: int):
-    """Logs the initialization and lock acquisition for the GPU thread."""
     print("-" * 60)
     if is_utility:
         logger.info(f"[GPU LOCK] Utility request {request_id} acquired exclusive GPU access.")
@@ -24,142 +27,123 @@ def _log_stream_start(request_id: str, is_utility: bool, prompt_len: int):
         print(f"🖥️ [Agent Stream | Context: {prompt_len} tokens] ", end="")
     sys.stdout.flush()
 
-def _process_tool_call(full_text: str, parser: QwenXmlParser) -> tuple:
-    """Extracts tool name and arguments from the full generated response text."""
-    # 🎯 Extract function name from full response text
-    func_match = re.search(r'<function=([^>]+)>', full_text)
-    if func_match:
-        tool_name = func_match.group(1).strip()
-    else:
-        tool_name = parser.tool_name if parser.tool_name else "shell"
-
-    # 🎯 FIX: Restore the original, working regex parser directly over full_text
+def _parse_xml_arguments(full_text: str) -> dict:
+    """Helper method to parse raw text attributes into clean dictionary layouts."""
     param_matches = re.findall(r'<parameter=([^>]+)>(.*?)(?:</parameter>|$)', full_text, re.DOTALL)
-    
     args_dict = {}
     for p_name, p_val in param_matches:
         clean_val = p_val.replace("</parameter>", "").strip()
-        if clean_val.isdigit():
-            args_dict[p_name.strip()] = int(clean_val)
-        else:
-            args_dict[p_name.strip()] = clean_val
+        args_dict[p_name.strip()] = int(clean_val) if clean_val.isdigit() else clean_val
 
-    # Fallback to extract raw JSON if XML structure is missing but JSON block exists
     if not args_dict and "{" in full_text:
         try:
             json_match = re.search(r'(\{.*?\})', full_text, re.DOTALL)
-            if json_match:
-                args_dict = json.loads(json_match.group(1))
-        except Exception:
-            pass
-
-    final_json_args = json.dumps(args_dict, ensure_ascii=False)
-    logger.info(f"Generated Tool Call: '{tool_name}' with args: {final_json_args}")
-    return tool_name, final_json_args
+            if json_match: args_dict = json.loads(json_match.group(1))
+        except Exception: pass
+    return args_dict
 
 def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id, has_tools, prefill_step_size, global_cache, queue, loop, model_name, prompt_tokens_len):
     """Background worker with absolute GPU thread isolation and token streaming."""
     global GPU_THREAD_LOCK
     GPU_THREAD_LOCK.acquire()
-
-    # 🎯 FIX FOR MULTI-THREADED METAL STREAMS IN MLX:
-    # Explicitly bind the current CPU thread to the default Apple Silicon GPU device/stream context
-    mx.set_default_device(mx.gpu)
     
+    mx.set_default_device(mx.gpu)
     is_utility = not has_tools
     _log_stream_start(request_id, is_utility, prompt_tokens_len)
+    
+    current_prefill_speed = 0.0
+    current_decode_speed = 0.0
     
     try:
         full_response_text = ""
         tokens_count = 0
         parser = QwenXmlParser()
         
-        # Track precise prefill evaluation time
+        # Safely evaluate persistent memory state maps inside this specific thread context
+        try:
+            if isinstance(global_cache, list) and len(global_cache) > 0:
+                if getattr(global_cache, "keys", None) is not None:
+                    mx.eval([c.state for c in global_cache])
+        except Exception: pass
+        
         prefill_start_time = time.perf_counter()
         
-        generator_instance = stream_generate(
-            model, tokenizer, 
-            prompt=prompt_ids, 
-            max_tokens=max_tokens, 
-            prompt_cache=global_cache, 
-            prefill_step_size=prefill_step_size
-        )
-
-        # ⚡️ Evaluate and process the first token (Prefill phase)
-        try:
-            first_response = next(generator_instance)
-            prefill_time = time.perf_counter() - prefill_start_time
-            
-            token = first_response.text
-            full_response_text += token
-            tokens_count += 1
-            
-            # Print evaluation metrics for the evaluated token chunk
-            chunk_len = len(prompt_ids)
-            prefill_speed = chunk_len / prefill_time if prefill_time > 0 else 0
-            logger.info(f"Prefill finished: evaluated {chunk_len} tokens in {prefill_time:.4f}s ({prefill_speed:.2f} tok/s)")
-            
-            is_tool = parser.parse_chunk(token) if has_tools else False
-            if not is_tool:
-                asyncio.run_coroutine_threadsafe(
-                    queue.put(build_streaming_chunk(request_id=request_id, model_name=model_name, content=token)), 
-                    loop
-                )
-        except StopIteration:
-            return
-
-        generation_start_time = time.time()
-
-        # 🏃‍♂️ Token streaming loop (Decoding phase)
-        for response in generator_instance:
-            token = response.text
-            full_response_text += token
-            tokens_count += 1
-            
-            in_tool_call = parser.parse_chunk(token) if has_tools else False
-            
-            # Intercept XML tool calls to prevent raw tags from breaking the Goose UI markdown
-            if in_tool_call:
-                sys.stdout.write(token)
-                sys.stdout.flush()
-                continue
-
-            sys.stdout.write(token)
-            sys.stdout.flush()
-            
-            asyncio.run_coroutine_threadsafe(
-                queue.put(build_streaming_chunk(request_id=request_id, model_name=model_name, content=token)), 
-                loop
+        # Run inside hard localized stream manager context boundary
+        with mx.StreamContext(mx.default_stream(mx.gpu)):
+            generator_instance = stream_generate(
+                model, tokenizer, prompt=prompt_ids, max_tokens=max_tokens, 
+                prompt_cache=global_cache, prefill_step_size=prefill_step_size
             )
 
-        print() # Close the stream console print line
-        
-        # 🎯 Total context length mapping directly from server state
-        total_prompt_context_len = prompt_tokens_len
+            try:
+                first_response = next(generator_instance)
+                prefill_time = time.perf_counter() - prefill_start_time
+                token = first_response.text
+                full_response_text += token
+                tokens_count += 1
+                
+                chunk_len = len(prompt_ids)
+                current_prefill_speed = chunk_len / prefill_time if prefill_time > 0 else 0.0
+                
+                is_tool = parser.parse_chunk(token) if has_tools else False
+                if not is_tool:
+                    asyncio.run_coroutine_threadsafe(
+                        queue.put(build_streaming_chunk(request_id=request_id, model_name=model_name, content=token)), loop
+                    )
+            except StopIteration: return
 
-        # Emit the final completion chunk with accurate Goose Usage telemetry
+            generation_start_time = time.time()
+
+            for response in generator_instance:
+                token = response.text
+                full_response_text += token
+                tokens_count += 1
+                
+                in_tool_call = parser.parse_chunk(token) if has_tools else False
+                if in_tool_call:
+                    sys.stdout.write(token)
+                    sys.stdout.flush()
+                    continue
+
+                sys.stdout.write(token)
+                sys.stdout.flush()
+                
+                asyncio.run_coroutine_threadsafe(
+                    queue.put(build_streaming_chunk(request_id=request_id, model_name=model_name, content=token)), loop
+                )
+
+        print()
+        generation_time = time.time() - generation_start_time
+        current_decode_speed = tokens_count / generation_time if generation_time > 0 else 0.0
+
         if has_tools and parser.in_tool_call:
-            t_name, t_args = _process_tool_call(full_response_text, parser)
+            extracted_args = _parse_xml_arguments(full_response_text)
+            
+            # 🎯 Route directly to the isolated Anti-Loop Sub-Module Engine
+            t_name, t_args = anti_loop_engine.evaluate_and_process(full_response_text, parser.tool_name, extracted_args)
+            
             asyncio.run_coroutine_threadsafe(
                 queue.put(build_streaming_chunk(
-                    request_id=request_id, model_name=model_name, 
-                    tool_name=t_name, tool_args=t_args, finish_reason="tool_calls", 
-                    prompt_len=total_prompt_context_len, completion_len=tokens_count
+                    request_id=request_id, model_name=model_name, tool_name=t_name, tool_args=t_args, 
+                    finish_reason="tool_calls", prompt_len=prompt_tokens_len, completion_len=tokens_count
                 )), loop
             )
         else:
             asyncio.run_coroutine_threadsafe(
                 queue.put(build_streaming_chunk(
                     request_id=request_id, model_name=model_name, finish_reason="stop", 
-                    prompt_len=total_prompt_context_len, completion_len=tokens_count
+                    prompt_len=prompt_tokens_len, completion_len=tokens_count
                 )), loop
             )
             
-        generation_time = time.time() - generation_start_time
-        if generation_time > 0:
-            decoding_speed = tokens_count / generation_time
-            logger.info(f"[TRACKER METRICS] Reported context size to Goose: {total_prompt_context_len} tokens.")
-            logger.info(f"Decoding finished: generated {tokens_count} tokens in {generation_time:.2f}s ({decoding_speed:.2f} tok/s)")
+        # 🎯 Route filtered telemetry straight to the isolated Performance Tracker Sub-Module
+        perf_tracker.record_metrics(
+            current_prefill_speed, 
+            current_decode_speed, 
+            total_context_len=prompt_tokens_len,
+            prompt_chunk_len=chunk_len,       # Real size of evaluated tokens chunk
+            completion_len=tokens_count        # Real size of generated response
+        )
 
     except Exception as e:
         logger.exception(f"Critical exception inside GPU worker execution loop: {str(e)}")
@@ -170,22 +154,17 @@ def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id,
         print("-" * 60)
 
 async def async_queue_bridge(model, tokenizer, prompt_ids, max_tokens, request_id, has_tools, prefill_step_size, global_cache, model_name, prompt_tokens_len):
-    """Asynchronous transit gateway bridging threadpool queue execution to FastAPI SSE stream."""
     from starlette.concurrency import run_in_threadpool
     queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
-    
     asyncio.create_task(
         run_in_threadpool(
-            sync_generation_worker, 
-            model, tokenizer, prompt_ids, max_tokens, request_id, has_tools, 
+            sync_generation_worker, model, tokenizer, prompt_ids, max_tokens, request_id, has_tools, 
             prefill_step_size, global_cache, queue, loop, model_name, prompt_tokens_len
         )
     )
-    
     while True:
         chunk = await queue.get()
-        if chunk is None:
-            break
+        if chunk is None: break
         yield chunk
     yield "data: [DONE]\n\n"
