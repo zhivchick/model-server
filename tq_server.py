@@ -1,6 +1,8 @@
 import uuid
 import argparse
 import logging
+import datetime
+import re
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 import uvicorn
@@ -9,43 +11,46 @@ import mlx_lm
 from goose_hooks import apply_pre_call_hooks
 from stream_bridge import async_queue_bridge
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-logger = logging.getLogger("mlx_lm_server")
-
+# Настройка парсера аргументов командной строки
 parser = argparse.ArgumentParser(description="Stateful Multi-Session MLX Server")
 parser.add_argument("--model", type=str, required=True)
 parser.add_argument("--host", type=str, default="127.0.0.1")
 parser.add_argument("--port", type=int, default=8080)
 parser.add_argument("--max-tokens", type=int, default=4096)
 parser.add_argument("--prefill-step-size", type=int, default=512)
+parser.add_argument("--log-level", type=str, default="info", choices=["info", "debug", "warning", "error"])
 args, unknown = parser.parse_known_args()
+
+# Конфигурация логгера
+numeric_level = getattr(logging, args.log_level.upper(), logging.INFO)
+logging.basicConfig(level=numeric_level, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+logger = logging.getLogger("mlx_lm_server")
+
+# ANSI-палитра для красивой раскраски консоли
+C_GREEN = "\033[92m"
+C_YELLOW = "\033[93m"
+C_RESET = "\033[0m"
 
 print(f"📦 Loading model: {args.model}...")
 model, tokenizer = mlx_lm.load(args.model)
 
 def make_persistent_cache():
-    if hasattr(model, "make_cache"):
-        cache = model.make_cache()
+    from mlx_lm.models.cache import make_prompt_cache
+    try:
+        cache = make_prompt_cache(model)
         for layer_cache in cache:
             if hasattr(layer_cache, "bits"): layer_cache.bits = 3
             if hasattr(layer_cache, "quantized_start"): layer_cache.quantized_start = 64
         return cache
-    from mlx_lm.models.base import create_kv_cache
-    return create_kv_cache(model)
+    except Exception:
+        from mlx_lm.models.cache import KVCache
+        return [KVCache() for _ in range(len(model.layers) if hasattr(model, "layers") else 32)]
 
-# 🎯 Persistent VRAM Memory Sessions (Agent vs Utility)
-GLOBAL_CACHE_REGISTRY = {
-    "agent": make_persistent_cache(),
-    "utility": make_persistent_cache()
-}
+# Инициализируем аппаратный кэш Агента
+AGENT_CACHE = make_persistent_cache()
+PREVIOUS_AGENT_IDS = []
 
-# 🎯 Persistent token ID sequence storage
-PREVIOUS_IDS_REGISTRY = {
-    "agent": [],
-    "utility": []
-}
-
-print("\n" + "="*60 + "\n🚀 [Goose Stateful Server] Successfully Initialization Complete!\n💡 Framework: Persistent VRAM Memory Sessions (Apple Style)\n" + "="*60 + "\n")
+print("\n" + "="*60 + f"\n🚀 [Goose Server] Time-Locked Production Engine Active!\n💡 Mode: Agent Persistent / Utility Ephemeral\nLog Level: {args.log_level.upper()}\n" + "="*60 + "\n")
 app = FastAPI()
 
 def find_longest_common_token_prefix(list1: list, list2: list) -> int:
@@ -56,7 +61,8 @@ def find_longest_common_token_prefix(list1: list, list2: list) -> int:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    global GLOBAL_CACHE_REGISTRY, PREVIOUS_IDS_REGISTRY
+    global AGENT_CACHE, PREVIOUS_AGENT_IDS
+    
     body = await request.json()
     max_tokens = body.get("max_tokens", args.max_tokens)
     request_id = f"chatcmpl-{uuid.uuid4()}"
@@ -64,67 +70,103 @@ async def chat_completions(request: Request):
     fixed_messages, template_kwargs = apply_pre_call_hooks(body)
     has_tools = body.get("tools") is not None
     
-    # 🎯 BULLETPROOF SESSION ROUTING V2
-    if fixed_messages:
-        last_role = fixed_messages[-1].get("role")
-        if last_role in ["user", "tool", "assistant"]:
-            session_key = "agent"
-        else:
-            session_key = "utility"
-    else:
-        session_key = "utility"
+    # Железная сегрегация ролей по наличию инструментов
+    is_agent = has_tools
 
     full_prompt_string = tokenizer.apply_chat_template(fixed_messages, **template_kwargs)
-    current_prompt_ids = tokenizer.encode(full_prompt_string)
+    
+    # 🎯 «ЗАМOК ВРЕМЕНИ»: Маскируем ежеминутно тикающий тег Goose.
+    # Заменяем цифры времени на константу строго для токенизации и сравнения префиксов!
+    prompt_for_cache_comparison = re.sub(
+        r"<current-time>.*?</current-time>", 
+        "<current-time>STATIC_TIME_LOCK</current-time>", 
+        full_prompt_string
+    )
+    
+    current_prompt_ids = tokenizer.encode(prompt_for_cache_comparison)
     total_prompt_len = len(current_prompt_ids)
 
-    logger.info(f"POST /v1/chat/completions | Session target: [{session_key.upper()}] (ID: {request_id})")
-
-    prev_ids = PREVIOUS_IDS_REGISTRY[session_key]
-    active_cache = GLOBAL_CACHE_REGISTRY[session_key]
-    
-    if prev_ids:
-        matched_tokens_len = find_longest_common_token_prefix(prev_ids, current_prompt_ids)
+    # СЦЕНАРИЙ 1: СЛУЖЕБНЫЙ ЗАПРОС (UTILITY) -> ИЗОЛИРОВАННЫЙ КЭШ
+    if not is_agent:
+        logger.info(f"POST /v1/chat/completions | Target: [UTILITY] (ID: {request_id})")
+        logger.info(f"🧹 [Utility Ephemeral] Context maps evaluated: {total_prompt_len} tokens.")
+        ephemeral_cache = make_persistent_cache()
         
+        return StreamingResponse(
+            async_queue_bridge(
+                model, tokenizer, current_prompt_ids, max_tokens, request_id, has_tools, 
+                args.prefill_step_size, ephemeral_cache, args.model, total_prompt_len, None
+            ),
+            media_type="text/event-stream"
+        )
+
+    # СЦЕНАРИЙ 2: БОЕВОЙ АГЕНТ (AGENT) -> РАБОТАЕТ ВЕЧНЫЙ КЭШ
+    logger.info(f"POST /v1/chat/completions | Target: [AGENT] (ID: {request_id})")
+    
+    if PREVIOUS_AGENT_IDS:
+        matched_tokens_len = find_longest_common_token_prefix(PREVIOUS_AGENT_IDS, current_prompt_ids)
+        
+        # Легкая трассировка номеров токенов уходит в DEBUG
+        if matched_tokens_len > 0 and matched_tokens_len < len(PREVIOUS_AGENT_IDS) and matched_tokens_len < len(current_prompt_ids):
+            token_prev = PREVIOUS_AGENT_IDS[matched_tokens_len]
+            token_curr = current_prompt_ids[matched_tokens_len]
+            logger.debug(f"🔍 [CACHE TRACE] Split index: {matched_tokens_len} | Prev Token ID: {token_prev} vs Curr Token ID: {token_curr}")
+
+        # 🎯 SMART DIFF TRIGGER: Если кэш Агента обвалился более чем на 5000 токенов
+        cache_drop_size = len(PREVIOUS_AGENT_IDS) - matched_tokens_len
+        if cache_drop_size >= 5000:
+            timestamp = datetime.datetime.now().strftime("%H_%M_%S")
+            file_saved = f"saved_drop_{timestamp}.txt"
+            file_new = f"new_drop_{timestamp}.txt"
+            try:
+                with open(file_saved, "w", encoding="utf-8") as f:
+                    f.write(tokenizer.decode(PREVIOUS_AGENT_IDS))
+                with open(file_new, "w", encoding="utf-8") as f:
+                    f.write(tokenizer.decode(current_prompt_ids))
+                logger.warning(
+                    f"{C_YELLOW}⚠️ [CRITICAL CACHE DROP] Context collapsed by {cache_drop_size} tokens! "
+                    f"Dumped snapshots: diff {file_saved} {file_new}{C_RESET}"
+                )
+            except Exception as e:
+                logger.debug(f"Failed to write smart diff files: {str(e)}")
+
         if matched_tokens_len > 300:
             prompt_ids_chunk = current_prompt_ids[matched_tokens_len:]
             
             if len(prompt_ids_chunk) == 0:
                 matched_tokens_len -= 1
                 prompt_ids_chunk = [current_prompt_ids[-1]]
-                logger.info("⚠️ 100% Cache Hit detected (0 new tokens). Adjusting cache offset by -1 to trigger generation.")
             
-            for layer_cache in active_cache:
-                if hasattr(layer_cache, "offset"): layer_cache.offset = matched_tokens_len
-                elif hasattr(layer_cache, "step"): layer_cache.step = matched_tokens_len
+            # Сдвигаем offset Metal API только если произошел честный глубокий откат истории
+            if matched_tokens_len < len(PREVIOUS_AGENT_IDS):
+                for layer_cache in AGENT_CACHE:
+                    if hasattr(layer_cache, "offset"): layer_cache.offset = matched_tokens_len
+                    elif hasattr(layer_cache, "step"): layer_cache.step = matched_tokens_len
             
-            logger.info(f"🎯 [Cache {session_key.upper()} Hit] Reused context: {matched_tokens_len} tokens. Evaluating delta remainder: {len(prompt_ids_chunk)} tokens.")
-            PREVIOUS_IDS_REGISTRY[session_key] = current_prompt_ids
+            # Подсвечиваем сочным зеленым цветом цифру совпавшего контекста
+            logger.info(f"🎯 [Cache AGENT Hit] Reused context: {C_GREEN}{matched_tokens_len}{C_RESET} tokens. Evaluating delta remainder: {len(prompt_ids_chunk)} tokens.")
+            
+            PREVIOUS_AGENT_IDS = current_prompt_ids
             
             return StreamingResponse(
                 async_queue_bridge(
                     model, tokenizer, prompt_ids_chunk, max_tokens, request_id, has_tools, 
-                    args.prefill_step_size, active_cache, args.model, prompt_tokens_len=total_prompt_len
+                    args.prefill_step_size, AGENT_CACHE, args.model, total_prompt_len, None
                 ),
                 media_type="text/event-stream"
             )
 
-    if len(fixed_messages) <= 2:
-        logger.info(f"🧹 [Cache {session_key.upper()} Reset] Fresh execution stream chain initialization. Buffers cleared.")
-    else:
-        logger.info(f"🧹 [Cache {session_key.upper()} Miss] Session history prefix mismatch tracking. Full contextual evaluation required: {total_prompt_len} tokens.")
-        
-    active_cache = make_persistent_cache()
-    GLOBAL_CACHE_REGISTRY[session_key] = active_cache
-    PREVIOUS_IDS_REGISTRY[session_key] = current_prompt_ids
+    logger.info(f"🧹 [Cache AGENT Miss] Full evaluation required: {total_prompt_len} tokens.")
+    AGENT_CACHE = make_persistent_cache()
+    PREVIOUS_AGENT_IDS = current_prompt_ids
     
     return StreamingResponse(
         async_queue_bridge(
             model, tokenizer, current_prompt_ids, max_tokens, request_id, has_tools, 
-            args.prefill_step_size, active_cache, args.model, prompt_tokens_len=total_prompt_len
+            args.prefill_step_size, AGENT_CACHE, args.model, total_prompt_len, None
         ),
         media_type="text/event-stream"
     )
 
-if __name__ == "__main__":
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+# Запуск Uvicorn
+uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
