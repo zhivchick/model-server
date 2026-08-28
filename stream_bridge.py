@@ -43,9 +43,6 @@ def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id,
     logger.debug(f"🚀 Entering sync_generation_worker for request: {request_id}")
     
     mx.set_default_device(mx.gpu)
-    
-    # 🎯 ЖЕСТКОЕ ВЫРАВНИВАНИЕ: Роль определяется строго по наличию инструментов,
-    # чтобы логика tq_server и stream_bridge полностью совпала!
     is_utility = not has_tools
     _log_stream_start(request_id, is_utility, prompt_tokens_len)
     
@@ -168,10 +165,6 @@ def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id,
         logger.exception(f"Critical exception inside GPU worker execution loop: {str(e)}")
     finally:
         asyncio.run_coroutine_threadsafe(queue.put(None), loop)
-        
-        if server_lock and server_lock.locked():
-            server_lock.release()
-            
         logger.info(f"[GPU RELEASED] Request {request_id} execution finalized.")
         print("-" * 60)
 
