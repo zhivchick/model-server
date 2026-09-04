@@ -11,6 +11,7 @@ import uvicorn
 import mlx_lm
 from goose_hooks import apply_pre_call_hooks
 from stream_bridge import async_queue_bridge
+from goose_killer import trigger_goose_compaction_break  # 🎯 Импортируем наш скрытый модуль прерывания
 
 # Настройка парсера аргументов командной строки
 parser = argparse.ArgumentParser(description="Stateful Multi-Session MLX Server")
@@ -32,6 +33,10 @@ C_GREEN = "\033[92m"
 C_YELLOW = "\033[93m"
 C_RESET = "\033[0m"
 
+# 🎯 ПОРОГ АВТО-ПРЕРЫВАНИЯ СЕССИИ (В ТОКЕНАХ)
+# Как только контекст превысит эту планку, сервер принудительно разорвет Chaining Goose!
+CONTEXT_LIMIT_TRIGGER = 6000
+
 print(f"📦 Loading model: {args.model}...")
 model, tokenizer = mlx_lm.load(args.model)
 
@@ -47,14 +52,17 @@ def make_persistent_cache():
         from mlx_lm.models.cache import KVCache
         return [KVCache() for _ in range(len(model.layers) if hasattr(model, "layers") else 32)]
 
-# Инициализируем аппаратный кэш Агента
+# Инициализируем аппаратно разделенные кэши
 AGENT_CACHE = make_persistent_cache()
 PREVIOUS_AGENT_IDS = []
+
+COMPACTION_CACHE = make_persistent_cache()
+PREVIOUS_COMPACTION_IDS = []
 
 # Глобальный асинхронный замок против гонки на чипе Metal
 ASYNC_SERVER_LOCK = None
 
-print("\n" + "="*60 + f"\n🚀 [Goose Server] Asynchronous Serialized Engine Active!\n💡 Mode: Agent Persistent / Utility Ephemeral\nLog Level: {args.log_level.upper()}\n" + "="*60 + "\n")
+print("\n" + "="*60 + f"\n🚀 [Goose Server] Autonomic Watchdog Engine Active!\n💡 Protection: Self-Interrupting Chaining at {CONTEXT_LIMIT_TRIGGER} tokens\n" + "="*60 + "\n")
 app = FastAPI()
 
 def find_longest_common_token_prefix(list1: list, list2: list) -> int:
@@ -65,12 +73,11 @@ def find_longest_common_token_prefix(list1: list, list2: list) -> int:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    global AGENT_CACHE, PREVIOUS_AGENT_IDS, ASYNC_SERVER_LOCK
+    global AGENT_CACHE, PREVIOUS_AGENT_IDS, COMPACTION_CACHE, PREVIOUS_COMPACTION_IDS, ASYNC_SERVER_LOCK
     
     if ASYNC_SERVER_LOCK is None:
         ASYNC_SERVER_LOCK = asyncio.Lock()
         
-    # Мягко встаем в асинхронную очередь без блокировки CPU-потоков FastAPI
     await ASYNC_SERVER_LOCK.acquire()
     
     try:
@@ -80,23 +87,61 @@ async def chat_completions(request: Request):
         
         fixed_messages, template_kwargs = apply_pre_call_hooks(body)
         has_tools = body.get("tools") is not None
-        
         is_agent = has_tools
 
         full_prompt_string = tokenizer.apply_chat_template(fixed_messages, **template_kwargs)
         
-        # «ЗАМOК ВРЕМЕНИ»: Фиксируем тикающий тег current-time для 100% Cache Hit
-        prompt_for_cache_comparison = re.sub(
-            r"<current-time>.*?</current-time>", 
-            "<current-time>STATIC_TIME_LOCK</current-time>", 
-            full_prompt_string
-        )
+        # «ЗАМOК ВРЕМЕНИ» И «ЗАМOК КОМПАКЦИИ» против мутаций системной шапки
+        prompt_for_cache_comparison = re.sub(r"<current-time>.*?</current-time>", "<current-time>STATIC_TIME_LOCK</current-time>", full_prompt_string)
+        prompt_for_cache_comparison = re.sub(r"<compaction>.*?</compaction>", "<compaction>STATIC_COMPACTION_LOCK</compaction>", prompt_for_cache_comparison)
         
         current_prompt_ids = tokenizer.encode(prompt_for_cache_comparison)
         total_prompt_len = len(current_prompt_ids)
 
-        # СЦЕНАРИЙ 1: СЛУЖЕБНЫЙ ЗАПРОС (UTILITY) -> ИЗОЛИРОВАННЫЙ КЭШ
+        # ------------------------------------------------------------
+        # СЦЕНАРИЙ 1: СЛУЖЕБНЫЕ ЗАПРОСЫ (UTILITY / COMPACTION)
+        # ------------------------------------------------------------
         if not is_agent:
+            if total_prompt_len > 3000:
+                logger.info(f"POST /v1/chat/completions | Target: [COMPACTION RUN] (ID: {request_id})")
+                matched_len = 0
+                if PREVIOUS_COMPACTION_IDS:
+                    matched_len = find_longest_common_token_prefix(PREVIOUS_COMPACTION_IDS, current_prompt_ids)
+                
+                if matched_len > 300:
+                    prompt_chunk = current_prompt_ids[matched_len:]
+                    if len(prompt_chunk) == 0:
+                        matched_len -= 1
+                        prompt_chunk = [current_prompt_ids[-1]]
+                        
+                    if matched_len < len(PREVIOUS_COMPACTION_IDS):
+                        for layer in COMPACTION_CACHE:
+                            if hasattr(layer, "offset"): layer.offset = matched_len
+                            elif hasattr(layer, "step"): layer.step = matched_len
+                            
+                    logger.info(f"🎯 [Cache COMPACT Hit] Reused compaction context: {C_GREEN}{matched_len}{C_RESET} tokens. Delta: {len(prompt_chunk)}")
+                    PREVIOUS_COMPACTION_IDS = current_prompt_ids
+                    
+                    async def compact_hit_wrapper():
+                        try:
+                            async for chunk in async_queue_bridge(model, tokenizer, prompt_chunk, max_tokens, request_id, has_tools, args.prefill_step_size, COMPACTION_CACHE, args.model, total_prompt_len, None):
+                                yield chunk
+                        finally:
+                            if ASYNC_SERVER_LOCK.locked(): ASYNC_SERVER_LOCK.release()
+                    return StreamingResponse(compact_hit_wrapper(), media_type="text/event-stream")
+                
+                logger.info(f"🧹 [Cache COMPACT Miss] Evaluating full compaction background history: {total_prompt_len} tokens.")
+                COMPACTION_CACHE = make_persistent_cache()
+                PREVIOUS_COMPACTION_IDS = current_prompt_ids
+                
+                async def compact_miss_wrapper():
+                    try:
+                        async for chunk in async_queue_bridge(model, tokenizer, current_prompt_ids, max_tokens, request_id, has_tools, args.prefill_step_size, COMPACTION_CACHE, args.model, total_prompt_len, None):
+                            yield chunk
+                    finally:
+                        if ASYNC_SERVER_LOCK.locked(): ASYNC_SERVER_LOCK.release()
+                return StreamingResponse(compact_miss_wrapper(), media_type="text/event-stream")
+                
             logger.info(f"POST /v1/chat/completions | Target: [UTILITY] (ID: {request_id})")
             logger.info(f"🧹 [Utility Ephemeral] Context maps evaluated: {total_prompt_len} tokens.")
             ephemeral_cache = make_persistent_cache()
@@ -106,14 +151,17 @@ async def chat_completions(request: Request):
                     async for chunk in async_queue_bridge(model, tokenizer, current_prompt_ids, max_tokens, request_id, has_tools, args.prefill_step_size, ephemeral_cache, args.model, total_prompt_len, None):
                         yield chunk
                 finally:
-                    if ASYNC_SERVER_LOCK.locked():
-                        ASYNC_SERVER_LOCK.release()
-                        
+                    if ASYNC_SERVER_LOCK.locked(): ASYNC_SERVER_LOCK.release()
             return StreamingResponse(utility_stream_wrapper(), media_type="text/event-stream")
 
-        # СЦЕНАРИЙ 2: БОЕВОЙ АГЕНТ (AGENT) -> РАБОТАЕТ ВЕЧНЫЙ КЭШ
+        # ------------------------------------------------------------
+        # СЦЕНАРИЙ 2: БОЕВОЙ АГЕНТ (AGENT) -> ВЕЧНЫЙ КЭШ + WATCHDOG
+        # ------------------------------------------------------------
+    
+        # Выводим сочный лог, чтобы ты глазами видел ID чата в прямом эфире!
         logger.info(f"POST /v1/chat/completions | Target: [AGENT] (ID: {request_id})")
-        
+
+
         if PREVIOUS_AGENT_IDS:
             matched_tokens_len = find_longest_common_token_prefix(PREVIOUS_AGENT_IDS, current_prompt_ids)
             
@@ -122,28 +170,24 @@ async def chat_completions(request: Request):
                 token_curr = current_prompt_ids[matched_tokens_len]
                 logger.debug(f"🔍 [CACHE TRACE] Split index: {matched_tokens_len} | Prev Token ID: {token_prev} vs Curr Token ID: {token_curr}")
 
-            # SMART DIFF TRIGGER: Логируем падение кэша на диск только при аномалиях >= 5000 токенов
             cache_drop_size = len(PREVIOUS_AGENT_IDS) - matched_tokens_len
             if cache_drop_size >= 5000:
                 timestamp = datetime.datetime.now().strftime("%H_%M_%S")
                 file_saved = f"saved_drop_{timestamp}.txt"
                 file_new = f"new_drop_{timestamp}.txt"
                 try:
-                    with open(file_saved, "w", encoding="utf-8") as f:
-                        f.write(tokenizer.decode(PREVIOUS_AGENT_IDS))
-                    with open(file_new, "w", encoding="utf-8") as f:
-                        f.write(tokenizer.decode(current_prompt_ids))
+                    with open(file_saved, "w", encoding="utf-8") as f: f.write(tokenizer.decode(PREVIOUS_AGENT_IDS))
+                    with open(file_new, "w", encoding="utf-8") as f: f.write(tokenizer.decode(current_prompt_ids))
                     logger.warning(
-                        f"{C_YELLOW}⚠️ [CRITICAL CACHE DROP] Context collapsed by {cache_drop_size} tokens! "
-                        f"Dumped snapshots: diff {file_saved} {file_new}{C_RESET}"
+                    f"{C_YELLOW}⚠️ [CRITICAL CACHE DROP] Context collapsed by {cache_drop_size} tokens! "
+                    f"Dumped snapshots: diff {file_saved} {file_new}{C_RESET}"
                     )
-                except Exception as e:
-                    logger.debug(f"Failed to write smart diff files: {str(e)}")
+                except Exception: pass
 
             if matched_tokens_len > 300:
                 prompt_ids_chunk = current_prompt_ids[matched_tokens_len:]
-                
                 if len(prompt_ids_chunk) == 0:
+
                     matched_tokens_len -= 1
                     prompt_ids_chunk = [current_prompt_ids[-1]]
                 
@@ -183,6 +227,16 @@ async def chat_completions(request: Request):
         if ASYNC_SERVER_LOCK and ASYNC_SERVER_LOCK.locked():
             ASYNC_SERVER_LOCK.release()
         raise e
+
+@app.get("/v1/context/status")
+async def get_context_status():
+    global PREVIOUS_AGENT_IDS
+    current_len = len(PREVIOUS_AGENT_IDS)
+    # Ярко логируем каждый вызов от хука в консоль нашего сервера
+    logger.info(f"📊 {C_YELLOW}[HOOK API REQUEST]{C_RESET} External watchdog checked context size. Current: {C_GREEN}{current_len}{C_RESET} tokens.")
+    return {"total_prompt_len": current_len}
+
+
 
 # Запуск Uvicorn
 uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)

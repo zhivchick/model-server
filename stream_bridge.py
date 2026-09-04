@@ -25,7 +25,7 @@ def _log_stream_start(request_id: str, is_utility: bool, prompt_len: int):
     sys.stdout.flush()
 
 def _parse_xml_arguments(full_text: str) -> dict:
-    param_matches = re.findall(r'<parameter=([^>]+)>(.*?)(?:</parameter>|\$)', full_text, re.DOTALL)
+    param_matches = re.findall(r'<parameter=([^>]+)>(.*?)(?:</parameter>|$)', full_text, re.DOTALL)
     args_dict = {}
     for p_name, p_val in param_matches:
         clean_val = p_val.replace("</parameter>", "").strip()
@@ -37,6 +37,7 @@ def _parse_xml_arguments(full_text: str) -> dict:
             if json_match: args_dict = json.loads(json_match.group(1))
         except Exception: pass
     return args_dict
+
 
 def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id, has_tools, prefill_step_size, global_cache, queue, loop, model_name, prompt_tokens_len, server_lock):
     """Background worker executing inside Starlette run_in_threadpool context."""

@@ -30,5 +30,6 @@ mlx_models/
 
 # Logging outputs
 *.log
-
+debug/
 .DS_Store
+model-server.md
