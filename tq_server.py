@@ -82,6 +82,22 @@ async def chat_completions(request: Request):
     
     try:
         body = await request.json()
+
+        # 🎯 ХИРУРГИЧЕСКOЕ ЛOГИРOВАНИЕ ОШИБОК ТУЛА EDIT
+        messages_preview = body.get("messages", [])
+        if messages_preview and messages_preview[-1].get("role") == "tool":
+            last_tool_msg = messages_preview[-1]
+            # Проверяем, что это ответ на edit и там есть ругань на множественные совпадения
+            tool_content = str(last_tool_msg.get("content", ""))
+            if "Found" in tool_content and "matches" in tool_content:
+                logger.warning(
+                    f"\n{C_YELLOW}🔍 [EDIT TOOL OUTPUT AUDIT]{C_RESET}\n"
+                    f"The engine returned an ambiguity error to the model:\n"
+                    f"--------------------------------------------------\n"
+                    f"{tool_content}\n"
+                    f"--------------------------------------------------\n"
+                )
+
         max_tokens = body.get("max_tokens", args.max_tokens)
         request_id = f"chatcmpl-{uuid.uuid4()}"
         

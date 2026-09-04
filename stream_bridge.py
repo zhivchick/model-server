@@ -108,6 +108,7 @@ def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id,
         generation_time = time.time() - generation_start_time
         current_decode_speed = tokens_count / generation_time if generation_time > 0 else 0.0
 
+        # Main stream parsing is done. Now evaluate the firewall state.
         is_raw_json_tool = False
         json_tool_name = None
         json_tool_args = "{}"
@@ -129,20 +130,26 @@ def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id,
 
         if has_tools and (parser.in_tool_call or is_raw_json_tool):
             if is_raw_json_tool:
-                t_name, t_args = anti_loop_engine.evaluate_and_process(full_response_text, json_tool_name, json.loads(json_tool_args))
+                extracted_args = json.loads(json_tool_args)
+                tool_invocation_name = json_tool_name
             else:
                 extracted_args = _parse_xml_arguments(full_response_text)
-                t_name, t_args = anti_loop_engine.evaluate_and_process(full_response_text, parser.tool_name, extracted_args)
+                tool_invocation_name = parser.tool_name
+                
+            # 🔍 Передаем данные в файрвол для анализа петель
+            t_name, t_args = anti_loop_engine.evaluate_and_process(full_response_text, tool_invocation_name, extracted_args)
             
-            if t_name is None:
+            # 🎯 ЕСЛИ ПЕТЛИ НЕТ (t_name совпадает с оригиналом) — МЫ НЕ ДOКИДЫВАЕМ TOOL_CALLS ВДOГOНКУ!
+            # Мы просто закрываем текстовый стрим флагом "stop", позволяя Goose нативно сожрать чистый XML!
+            if t_name == tool_invocation_name:
                 asyncio.run_coroutine_threadsafe(
                     queue.put(build_streaming_chunk(
-                        request_id=request_id, model_name=model_name, 
-                        content=t_args, finish_reason="stop", 
+                        request_id=request_id, model_name=model_name, finish_reason="stop", 
                         prompt_len=prompt_tokens_len, completion_len=tokens_count
                     )), loop
                 )
             else:
+                # 🚨 ПЕТЛЯ ОБНАРУЖЕНА! Вот тут мы жестко перебиваем стрим и вбрасываем ошибку shell exit 1
                 asyncio.run_coroutine_threadsafe(
                     queue.put(build_streaming_chunk(
                         request_id=request_id, model_name=model_name, tool_name=t_name, tool_args=t_args, 
@@ -150,6 +157,7 @@ def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id,
                     )), loop
                 )
         else:
+            # Обычный текстовый ответ без инструментов
             asyncio.run_coroutine_threadsafe(
                 queue.put(build_streaming_chunk(
                     request_id=request_id, model_name=model_name, finish_reason="stop", 
@@ -161,6 +169,7 @@ def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id,
             current_prefill_speed, current_decode_speed, 
             total_context_len=prompt_tokens_len, prompt_chunk_len=chunk_len, completion_len=tokens_count
         )
+
 
     except Exception as e:
         logger.exception(f"Critical exception inside GPU worker execution loop: {str(e)}")
