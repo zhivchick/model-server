@@ -11,6 +11,7 @@ C_YELLOW = "\033[93m"
 C_GREEN  = "\033[92m"
 
 class AntiLoopEngine:
+    """Manages consecutive repetition blocks and triggers smart assists or loop blocks synchronously."""
     def __init__(self):
         self.last_tool = None
         self.last_skeleton = None
@@ -30,34 +31,34 @@ class AntiLoopEngine:
         current_skeleton = self._build_argument_skeleton(extracted_args_dict)
         final_json_args = json.dumps(extracted_args_dict, ensure_ascii=False)
 
-        # Проверяем, не застряли ли мы конкретно на инструменте правки кода
         is_edit_tool = tool_name in ["edit", "developer__edit", "patch"]
 
+        # ------------------------------------------------------------
+        # ХАК №2: ДЕТЕКТОР ИДЕНТИЧНЫХ ПРАВОК (ХОЛОСТОЙ ВЫЗОВ - DEPTH 0)
+        # ------------------------------------------------------------
+        if is_edit_tool:
+            before_str = extracted_args_dict.get("before", "")
+            after_str = extracted_args_dict.get("after", "")
+            if before_str and after_str and before_str.strip() == after_str.strip():
+                logger.error(f"{C_YELLOW}🚨 [EDIT IDLE DETECTED] Model sent identical before and after blocks! Deflecting.{C_RESET}")
+                forced_tool_name = "shell"
+                idle_warning_text = (
+                    "echo 'Execution Error: The \"before\" and \"after\" parameters are byte-for-byte identical. "
+                    "Your edit action did NOT change any code. Rewrite your \"after\" block to apply real modifications or use another tool.' && exit 1"
+                )
+                return forced_tool_name, json.dumps({"command": idle_warning_text}, ensure_ascii=False)
+
+        # ------------------------------------------------------------
+        # СИММЕТРИЧНАЯ МАТРИЦА ПOВТOРOВ (ХИТЫ НЕ СБРАСЫВАЮТСЯ!)
+        # ------------------------------------------------------------
         if self.last_tool == tool_name and self.last_skeleton == current_skeleton:
             self.hit_count += 1
             logger.warning(f"{C_YELLOW}⚠️ [ANTI-LOOP FIREWALL] Repetitive pattern found! Tool: '{tool_name}', Depth: {self.hit_count}{C_RESET}")
             
-            # 🎯 ИНТЕЛЛЕГЕНТНЫЙ ПЕРЕХВАТ ДЛЯ EDIT (Attempt 2+)
-            # Если модель тупит и присылает ТУ ЖЕ САМУЮ неуникальную правку,
-            # мы подменяем вызов на shell с жесткой инструкцией работы над ошибками!
-            if is_edit_tool and self.hit_count >= 2:
-                logger.error(f"{C_BOLD}{C_GREEN}💡 [SMART ASSIST] Ambiguous edit loop detected! Injecting prompt correction strategy.{C_RESET}")
-                
-                # Формируем команду, которая вернет модели в чат понятное руководство к действию
-                payload_instruction = (
-                    "echo 'Execution Error: The block you provided in the \"before\" parameter matches multiple lines in the file. "
-                    "Do NOT repeat the exact same \"before\" string. "
-                    "To fix this, look at the Match lines and rewrite your edit call by including 2-3 lines of surrounding code "
-                    "ABOVE and BELOW the target line inside both \"before\" and \"after\" parameters to make it unique.' && exit 1"
-                )
-                
-                # Сбрасываем счетчик, давая модели шанс исправиться на следующем шагу с новыми знаниями
-                self.hit_count = 0
-                return "shell", json.dumps({"command": payload_instruction}, ensure_ascii=False)
-
-            # EMERGENCY DIALOGUE BRAKE (для остальных затупов вроде shell на 4-й попытке)
-            if self.hit_count >= 4:
-                logger.error(f"{C_BOLD}{C_RED}🚨 [CONTEXT EMERGENCY] Hard threshold reached. Forcing Dialogue Brake!{C_RESET}")
+            # 🚨 КРИТИЧЕСКИЙ СТOП-КРАН НА ГЛУБИНЕ 3 (Четвертый повтор) - ОДИНАКOВЫЙ ДЛЯ ВСЕХ
+            if self.hit_count >= 3:
+                logger.error(f"{C_BOLD}{C_RED}🚨 [CONTEXT EMERGENCY] Hard threshold reached on tool '{tool_name}'. Forcing Dialogue Brake!{C_RESET}")
+                # Только здесь мы полностью очищаем стейт, так как цепочка Chaining прерывается физически
                 self.hit_count = 0
                 self.last_tool = None
                 self.last_skeleton = None
@@ -68,17 +69,28 @@ class AntiLoopEngine:
                 )
                 return None, compact_trigger_text
 
-            # Стандартная блокировка для бесконечных shell/ls команд на 2-й и 3-й попытках
-            if self.hit_count >= 2:
-                logger.error(f"{C_BOLD}{C_RED}🚨 [FIREWALL BRICKWALL] Continuous loop lock sustained on tool '{tool_name}'. Deflecting payload.{C_RESET}")
-                forced_tool_name = "shell"
-                payload_warning_text = (
-                    f"echo 'Execution Error: The tool \"{tool_name}\" is locked in an infinite repetition loop. "
-                    f"Action blocked by firewalled server framework constraints. Change your arguments"
-                    f"or tool usage strategy completely to proceed.' && exit 1"
+            # 🛠️ ДИНАМИЧЕСКИЕ ШАГИ НА ВИТКАХ 1 И 2 (Вброс ответов в модель)
+            forced_tool_name = "shell"
+            
+            if is_edit_tool:
+                    logger.error(f"{C_GREEN}💡 [SMART ASSIST] Continuous ambiguous edit detected! Injecting guide.{C_RESET}")
+                    payload_text = (
+                        "The block you provided in the \"before\" parameter matches multiple lines in the file."
+                        "Do NOT repeat the exact same \"before\" string. To fix this, look at the Match lines and rewrite your edit call"
+                        "by including 2-3 lines of surrounding code ABOVE and BELOW the target line inside both \"before\" and \"after\" parameters to make it unique."
+                    )
+            else:
+                # Стандартный жесткий блок для shell / ls / cat на Depth 1 и 2
+                logger.error(f"{C_YELLOW}🚨 [FIREWALL BRICKWALL] Continuous loop lock sustained on tool '{tool_name}'. Deflecting payload.{C_RESET}")
+                payload_text = (
+                    f"echo 'Execution Error: The tool \"{tool_name}\" called multiple times with the same parameters. "
+                    f"Change parameters or use another tool to continue' && exit 1"
                 )
-                return forced_tool_name, json.dumps({"command": payload_warning_text}, ensure_ascii=False)
+                
+            return forced_tool_name, json.dumps({"command": payload_text}, ensure_ascii=False)
+
         else:
+            # Свежий шаг — сбрасываем блокировки
             if self.hit_count > 0:
                 logger.info("🎉 [LOOP BROKEN] Model successfully pivoted to a different execution strategy. Flushing firewall blocks.")
             self.last_tool = tool_name
