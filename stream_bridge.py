@@ -136,12 +136,21 @@ def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id,
                 extracted_args = _parse_xml_arguments(full_response_text)
                 tool_invocation_name = parser.tool_name
                 
-            # 🔍 Передаем данные в файрвол для анализа петель
+            # Вызываем наш обновленный файрвол повторов
             t_name, t_args = anti_loop_engine.evaluate_and_process(full_response_text, tool_invocation_name, extracted_args)
             
-            # 🎯 ЕСЛИ ПЕТЛИ НЕТ (t_name совпадает с оригиналом) — МЫ НЕ ДOКИДЫВАЕМ TOOL_CALLS ВДOГOНКУ!
-            # Мы просто закрываем текстовый стрим флагом "stop", позволяя Goose нативно сожрать чистый XML!
-            if t_name == tool_invocation_name:
+            # 🎯 ХАК: АБСОЛЮТНЫЙ ТОРМОЗ ДИАЛОГА (t_name is None)
+            if t_name is None:
+                # Вбрасываем текст предупреждения как обычный финальный текст, обрывая Chaining намертво!
+                asyncio.run_coroutine_threadsafe(
+                    queue.put(build_streaming_chunk(
+                        request_id=request_id, model_name=model_name, 
+                        content=f"\n\n🛑 {t_args}\n", finish_reason="stop", 
+                        prompt_len=prompt_tokens_len, completion_len=tokens_count
+                    )), loop
+                )
+            # Если петли нет — мягко отдаем управление нативному XML-буферу клиента
+            elif t_name == tool_invocation_name:
                 asyncio.run_coroutine_threadsafe(
                     queue.put(build_streaming_chunk(
                         request_id=request_id, model_name=model_name, finish_reason="stop", 
@@ -149,13 +158,14 @@ def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id,
                     )), loop
                 )
             else:
-                # 🚨 ПЕТЛЯ ОБНАРУЖЕНА! Вот тут мы жестко перебиваем стрим и вбрасываем ошибку shell exit 1
+                # Вброс контролируемого shell exit 1 на витках 1 и 2
                 asyncio.run_coroutine_threadsafe(
                     queue.put(build_streaming_chunk(
                         request_id=request_id, model_name=model_name, tool_name=t_name, tool_args=t_args, 
                         finish_reason="tool_calls", prompt_len=prompt_tokens_len, completion_len=tokens_count
                     )), loop
                 )
+
         else:
             # Обычный текстовый ответ без инструментов
             asyncio.run_coroutine_threadsafe(
