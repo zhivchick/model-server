@@ -136,12 +136,11 @@ def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id,
                 extracted_args = _parse_xml_arguments(full_response_text)
                 tool_invocation_name = parser.tool_name
                 
-            # Вызываем наш обновленный файрвол повторов
+            # 🔍 Вызываем радар файрвола (возвращает строго 2 элемента)
             t_name, t_args = anti_loop_engine.evaluate_and_process(full_response_text, tool_invocation_name, extracted_args)
             
-            # 🎯 ХАК: АБСОЛЮТНЫЙ ТОРМОЗ ДИАЛОГА (t_name is None)
+            # 🎯 1. АБСОЛЮТНЫЙ ВЫЛЕТ НА ЮЗЕРА (Попытка 6, hit_count >= 5)
             if t_name is None:
-                # Вбрасываем текст предупреждения как обычный финальный текст, обрывая Chaining намертво!
                 asyncio.run_coroutine_threadsafe(
                     queue.put(build_streaming_chunk(
                         request_id=request_id, model_name=model_name, 
@@ -149,7 +148,7 @@ def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id,
                         prompt_len=prompt_tokens_len, completion_len=tokens_count
                     )), loop
                 )
-            # Если петли нет — мягко отдаем управление нативному XML-буферу клиента
+            # 🎯 2. ШТАТНЫЙ ХОД (Для всех витков и обычного Chaining)
             elif t_name == tool_invocation_name:
                 asyncio.run_coroutine_threadsafe(
                     queue.put(build_streaming_chunk(
@@ -157,8 +156,8 @@ def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id,
                         prompt_len=prompt_tokens_len, completion_len=tokens_count
                     )), loop
                 )
+            # 🎯 3. ПОДМЕНА ОТВЕТОВ ТУЛОВ НА РАННИХ ЭТАПАХ ПОДМЕНЫ
             else:
-                # Вброс контролируемого shell exit 1 на витках 1 и 2
                 asyncio.run_coroutine_threadsafe(
                     queue.put(build_streaming_chunk(
                         request_id=request_id, model_name=model_name, tool_name=t_name, tool_args=t_args, 

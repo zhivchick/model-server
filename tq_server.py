@@ -4,6 +4,7 @@ import logging
 import datetime
 import re
 import asyncio
+import json
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 import uvicorn
@@ -11,9 +12,10 @@ import uvicorn
 import mlx_lm
 from goose_hooks import apply_pre_call_hooks
 from stream_bridge import async_queue_bridge
-from goose_killer import trigger_goose_compaction_break  # 🎯 Импортируем наш скрытый модуль прерывания
 
-# Настройка парсера аргументов командной строки
+# ------------------------------------------------------------
+# ⚙️ НАСТРОЙКИ И ИНИЦИАЛИЗАЦИЯ
+# ------------------------------------------------------------
 parser = argparse.ArgumentParser(description="Stateful Multi-Session MLX Server")
 parser.add_argument("--model", type=str, required=True)
 parser.add_argument("--host", type=str, default="127.0.0.1")
@@ -23,236 +25,160 @@ parser.add_argument("--prefill-step-size", type=int, default=512)
 parser.add_argument("--log-level", type=str, default="info", choices=["info", "debug", "warning", "error"])
 args, unknown = parser.parse_known_args()
 
-# Конфигурация логгера
 numeric_level = getattr(logging, args.log_level.upper(), logging.INFO)
 logging.basicConfig(level=numeric_level, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger("mlx_lm_server")
 
-# ANSI-палитра для красивой раскраски консоли
-C_GREEN = "\033[92m"
-C_YELLOW = "\033[93m"
-C_RESET = "\033[0m"
-
-# 🎯 ПОРОГ АВТО-ПРЕРЫВАНИЯ СЕССИИ (В ТОКЕНАХ)
-# Как только контекст превысит эту планку, сервер принудительно разорвет Chaining Goose!
-CONTEXT_LIMIT_TRIGGER = 6000
+C_GREEN, C_YELLOW, C_RESET = "\033[92m", "\033[93m", "\033[0m"
 
 print(f"📦 Loading model: {args.model}...")
 model, tokenizer = mlx_lm.load(args.model)
 
-def make_persistent_cache():
-    from mlx_lm.models.cache import make_prompt_cache
-    try:
-        cache = make_prompt_cache(model)
-        for layer_cache in cache:
-            if hasattr(layer_cache, "bits"): layer_cache.bits = 3
-            if hasattr(layer_cache, "quantized_start"): layer_cache.quantized_start = 64
-        return cache
-    except Exception:
-        from mlx_lm.models.cache import KVCache
-        return [KVCache() for _ in range(len(model.layers) if hasattr(model, "layers") else 32)]
-
-# Инициализируем аппаратно разделенные кэши
-AGENT_CACHE = make_persistent_cache()
+# Реестры аппаратно разделенных кэшей Apple Metal
+AGENT_CACHE = [mlx_lm.models.cache.KVCache() for _ in range(32)] # Ленивая инициализация в функции
 PREVIOUS_AGENT_IDS = []
-
-COMPACTION_CACHE = make_persistent_cache()
+COMPACTION_CACHE = [mlx_lm.models.cache.KVCache() for _ in range(32)]
 PREVIOUS_COMPACTION_IDS = []
+ASYNC_SERVER_LOCK = asyncio.Lock()
 
-# Глобальный асинхронный замок против гонки на чипе Metal
-ASYNC_SERVER_LOCK = None
-
-print("\n" + "="*60 + f"\n🚀 [Goose Server] Autonomic Watchdog Engine Active!\n💡 Protection: Self-Interrupting Chaining at {CONTEXT_LIMIT_TRIGGER} tokens\n" + "="*60 + "\n")
 app = FastAPI()
 
-def find_longest_common_token_prefix(list1: list, list2: list) -> int:
+# ------------------------------------------------------------
+# 🌐 ОСНОВНОЙ СЕТЕВОЙ ЭНДПОИНТ (МАКСИМАЛЬНО КОРОТКИЙ)
+# ------------------------------------------------------------
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    global AGENT_CACHE, PREVIOUS_AGENT_IDS, COMPACTION_CACHE, PREVIOUS_COMPACTION_IDS
+    
+    await ASYNC_SERVER_LOCK.acquire()
+    try:
+        body = await request.json()
+        request_id = f"chatcmpl-{uuid.uuid4()}"
+        
+        fixed_messages, template_kwargs = apply_pre_call_hooks(body)
+        is_agent = body.get("tools") is not None
+
+        # 🧠 Вызываем процедуры очистки и токенизации
+        fixed_messages = _apply_hardware_time_lock(fixed_messages)
+        current_prompt_ids, total_prompt_len = _render_and_tokenize(fixed_messages, template_kwargs)
+        _print_pipeline_telemetry(request_id, is_agent, total_prompt_len)
+
+        # Маршрутизация сценариев выполнения
+        if not is_agent:
+            return _handle_utility_scenarios(current_prompt_ids, total_prompt_len, request_id, body.get("max_tokens", args.max_tokens))
+        else:
+            return _handle_agent_scenarios(current_prompt_ids, total_prompt_len, request_id, body.get("max_tokens", args.max_tokens))
+
+    except Exception as e:
+        if ASYNC_SERVER_LOCK.locked(): ASYNC_SERVER_LOCK.release()
+        raise e
+
+# ------------------------------------------------------------
+# 🧠 ИЗОЛИРОВАННЫЕ ПРОЦЕДУРЫ ОБРАБОТКИ КОНТЕКСТА
+# ------------------------------------------------------------
+def _apply_hardware_time_lock(messages: list) -> list:
+    """Замораживает динамические теги времени в JSON до вызова токенизатора."""
+    for msg in messages:
+        if "content" in msg and isinstance(msg["content"], str):
+            content_str = msg["content"]
+            content_str = re.sub(r"<current-time>.*?</current-time>", "<current-time>STATIC_TIME_LOCK</current-time>", content_str)
+            content_str = re.sub(r"<compaction>.*?</compaction>", "<compaction>STATIC_COMPACTION_LOCK</compaction>", content_str)
+            msg["content"] = content_str
+    return messages
+
+def _render_and_tokenize(messages: list, template_kwargs: dict) -> tuple:
+    """Применяет Jinja-шаблон строго 1 раз и кодирует без скрытых токенов BOS."""
+    full_prompt_string = tokenizer.apply_chat_template(messages, **template_kwargs)
+    current_prompt_ids = tokenizer.encode(full_prompt_string, add_special_tokens=False)
+    return current_prompt_ids, len(current_prompt_ids)
+
+def _print_pipeline_telemetry(request_id: str, is_agent: bool, total_prompt_len: int):
+    """Выводит плоскую карту координат промпта в консоль."""
+    print(f"\n{'='*20} PROMPT DATA {'='*20}")
+    print(f"Request: {request_id} | Mode: {'[AGENT]' if is_agent else '[UTILITY]'} | Tokens: {total_prompt_len}")
+    print(f"{'='*53}\n")
+    import sys; sys.stdout.flush()
+
+# ------------------------------------------------------------
+# ⚡ ИЗОЛИРОВАННЫЕ СЦЕНАРИИ КЭШИРОВАНИЯ И ИНФЕРЕНСА
+# ------------------------------------------------------------
+def _handle_utility_scenarios(current_prompt_ids: list, total_prompt_len: int, request_id: str, max_tokens: int):
+    """Управляет фоновыми запросами и автотайтлами сессий."""
+    global COMPACTION_CACHE, PREVIOUS_COMPACTION_IDS
+    logger.info(f"POST /v1/chat/completions | Target: [UTILITY] (ID: {request_id})")
+    
+    # Режим компакта истории (>3000 токенов)
+    if total_prompt_len > 3000:
+        matched_len = _find_prefix(PREVIOUS_COMPACTION_IDS, current_prompt_ids)
+        if matched_len > 300:
+            prompt_chunk = current_prompt_ids[matched_len:]
+            _shift_cache_offset(COMPACTION_CACHE, matched_len)
+            PREVIOUS_COMPACTION_IDS = current_prompt_ids
+            return StreamingResponse(_bridge(prompt_chunk, max_tokens, request_id, False, COMPACTION_CACHE, total_prompt_len), media_type="text/event-stream")
+        
+        COMPACTION_CACHE = _make_fresh_cache()
+        PREVIOUS_COMPACTION_IDS = current_prompt_ids
+        return StreamingResponse(_bridge(current_prompt_ids, max_tokens, request_id, False, COMPACTION_CACHE, total_prompt_len), media_type="text/event-stream")
+        
+    # Обычный фоновый запрос (автотайтл сессии Goose)
+    ephemeral_cache = _make_fresh_cache()
+    return StreamingResponse(_bridge(current_prompt_ids, max_tokens, request_id, False, ephemeral_cache, total_prompt_len), media_type="text/event-stream")
+
+def _handle_agent_scenarios(current_prompt_ids: list, total_prompt_len: int, request_id: str, max_tokens: int):
+    """Управляет основным многовитоковым кэшем Агента."""
+    global AGENT_CACHE, PREVIOUS_AGENT_IDS
+    logger.info(f"POST /v1/chat/completions | Target: [AGENT] (ID: {request_id})")
+
+    if PREVIOUS_AGENT_IDS:
+        matched_tokens_len = _find_prefix(PREVIOUS_AGENT_IDS, current_prompt_ids)
+        if matched_tokens_len > 300:
+            prompt_ids_chunk = current_prompt_ids[matched_tokens_len:]
+            # 🎯 ЗАЩИТА ОТ VALUEERROR: Если дельта пустая, откатываемся на 1 токен назад
+            if len(prompt_ids_chunk) == 0:
+                matched_tokens_len -= 1
+                prompt_ids_chunk = [current_prompt_ids[-1]]
+                
+            _shift_cache_offset(AGENT_CACHE, matched_tokens_len)
+            logger.info(f"🎯 [Cache AGENT Hit] Reused context: {C_GREEN}{matched_tokens_len}{C_RESET} tokens. Delta: {len(prompt_ids_chunk)}")
+            PREVIOUS_AGENT_IDS = current_prompt_ids
+            return StreamingResponse(_bridge(prompt_ids_chunk, max_tokens, request_id, True, AGENT_CACHE, total_prompt_len), media_type="text/event-stream")
+
+    logger.info(f"🧹 [Cache AGENT Miss] Full evaluation required: {total_prompt_len} tokens.")
+    AGENT_CACHE = _make_fresh_cache()
+    PREVIOUS_AGENT_IDS = current_prompt_ids
+    return StreamingResponse(_bridge(current_prompt_ids, max_tokens, request_id, True, AGENT_CACHE, total_prompt_len), media_type="text/event-stream")
+
+# ------------------------------------------------------------
+# 🛠️ СЛУЖЕБНЫЕ УТИЛИТЫ КЭШ-ДВИЖКА
+# ------------------------------------------------------------
+def _find_prefix(list1: list, list2: list) -> int:
     min_len = min(len(list1), len(list2))
     for i in range(min_len):
         if list1[i] != list2[i]: return i
     return min_len
 
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
-    global AGENT_CACHE, PREVIOUS_AGENT_IDS, COMPACTION_CACHE, PREVIOUS_COMPACTION_IDS, ASYNC_SERVER_LOCK
-    
-    if ASYNC_SERVER_LOCK is None:
-        ASYNC_SERVER_LOCK = asyncio.Lock()
-        
-    await ASYNC_SERVER_LOCK.acquire()
-    
+def _make_fresh_cache():
     try:
-        body = await request.json()
+        cache = mlx_lm.models.cache.make_prompt_cache(model)
+        for layer in cache:
+            if hasattr(layer, "bits"): layer.bits = 3
+            if hasattr(layer, "quantized_start"): layer.quantized_start = 64
+        return cache
+    except Exception:
+        return [mlx_lm.models.cache.KVCache() for _ in range(len(model.layers) if hasattr(model, "layers") else 32)]
 
-        # 🎯 ХИРУРГИЧЕСКOЕ ЛOГИРOВАНИЕ ОШИБОК ТУЛА EDIT
-        messages_preview = body.get("messages", [])
-        if messages_preview and messages_preview[-1].get("role") == "tool":
-            last_tool_msg = messages_preview[-1]
-            # Проверяем, что это ответ на edit и там есть ругань на множественные совпадения
-            tool_content = str(last_tool_msg.get("content", ""))
-            if "Found" in tool_content and "matches" in tool_content:
-                logger.warning(
-                    f"\n{C_YELLOW}🔍 [EDIT TOOL OUTPUT AUDIT]{C_RESET}\n"
-                    f"The engine returned an ambiguity error to the model:\n"
-                    f"--------------------------------------------------\n"
-                    f"{tool_content}\n"
-                    f"--------------------------------------------------\n"
-                )
+def _shift_cache_offset(cache_registry: list, offset_val: int):
+    for layer in cache_registry:
+        if hasattr(layer, "offset"): layer.offset = offset_val
+        elif hasattr(layer, "step"): layer.step = offset_val
 
-        max_tokens = body.get("max_tokens", args.max_tokens)
-        request_id = f"chatcmpl-{uuid.uuid4()}"
-        
-        fixed_messages, template_kwargs = apply_pre_call_hooks(body)
-        has_tools = body.get("tools") is not None
-        is_agent = has_tools
-
-        full_prompt_string = tokenizer.apply_chat_template(fixed_messages, **template_kwargs)
-        
-        # «ЗАМOК ВРЕМЕНИ» И «ЗАМOК КОМПАКЦИИ» против мутаций системной шапки
-        prompt_for_cache_comparison = re.sub(r"<current-time>.*?</current-time>", "<current-time>STATIC_TIME_LOCK</current-time>", full_prompt_string)
-        prompt_for_cache_comparison = re.sub(r"<compaction>.*?</compaction>", "<compaction>STATIC_COMPACTION_LOCK</compaction>", prompt_for_cache_comparison)
-        
-        current_prompt_ids = tokenizer.encode(prompt_for_cache_comparison)
-        total_prompt_len = len(current_prompt_ids)
-
-        # ------------------------------------------------------------
-        # СЦЕНАРИЙ 1: СЛУЖЕБНЫЕ ЗАПРОСЫ (UTILITY / COMPACTION)
-        # ------------------------------------------------------------
-        if not is_agent:
-            if total_prompt_len > 3000:
-                logger.info(f"POST /v1/chat/completions | Target: [COMPACTION RUN] (ID: {request_id})")
-                matched_len = 0
-                if PREVIOUS_COMPACTION_IDS:
-                    matched_len = find_longest_common_token_prefix(PREVIOUS_COMPACTION_IDS, current_prompt_ids)
-                
-                if matched_len > 300:
-                    prompt_chunk = current_prompt_ids[matched_len:]
-                    if len(prompt_chunk) == 0:
-                        matched_len -= 1
-                        prompt_chunk = [current_prompt_ids[-1]]
-                        
-                    if matched_len < len(PREVIOUS_COMPACTION_IDS):
-                        for layer in COMPACTION_CACHE:
-                            if hasattr(layer, "offset"): layer.offset = matched_len
-                            elif hasattr(layer, "step"): layer.step = matched_len
-                            
-                    logger.info(f"🎯 [Cache COMPACT Hit] Reused compaction context: {C_GREEN}{matched_len}{C_RESET} tokens. Delta: {len(prompt_chunk)}")
-                    PREVIOUS_COMPACTION_IDS = current_prompt_ids
-                    
-                    async def compact_hit_wrapper():
-                        try:
-                            async for chunk in async_queue_bridge(model, tokenizer, prompt_chunk, max_tokens, request_id, has_tools, args.prefill_step_size, COMPACTION_CACHE, args.model, total_prompt_len, None):
-                                yield chunk
-                        finally:
-                            if ASYNC_SERVER_LOCK.locked(): ASYNC_SERVER_LOCK.release()
-                    return StreamingResponse(compact_hit_wrapper(), media_type="text/event-stream")
-                
-                logger.info(f"🧹 [Cache COMPACT Miss] Evaluating full compaction background history: {total_prompt_len} tokens.")
-                COMPACTION_CACHE = make_persistent_cache()
-                PREVIOUS_COMPACTION_IDS = current_prompt_ids
-                
-                async def compact_miss_wrapper():
-                    try:
-                        async for chunk in async_queue_bridge(model, tokenizer, current_prompt_ids, max_tokens, request_id, has_tools, args.prefill_step_size, COMPACTION_CACHE, args.model, total_prompt_len, None):
-                            yield chunk
-                    finally:
-                        if ASYNC_SERVER_LOCK.locked(): ASYNC_SERVER_LOCK.release()
-                return StreamingResponse(compact_miss_wrapper(), media_type="text/event-stream")
-                
-            logger.info(f"POST /v1/chat/completions | Target: [UTILITY] (ID: {request_id})")
-            logger.info(f"🧹 [Utility Ephemeral] Context maps evaluated: {total_prompt_len} tokens.")
-            ephemeral_cache = make_persistent_cache()
-            
-            async def utility_stream_wrapper():
-                try:
-                    async for chunk in async_queue_bridge(model, tokenizer, current_prompt_ids, max_tokens, request_id, has_tools, args.prefill_step_size, ephemeral_cache, args.model, total_prompt_len, None):
-                        yield chunk
-                finally:
-                    if ASYNC_SERVER_LOCK.locked(): ASYNC_SERVER_LOCK.release()
-            return StreamingResponse(utility_stream_wrapper(), media_type="text/event-stream")
-
-        # ------------------------------------------------------------
-        # СЦЕНАРИЙ 2: БОЕВОЙ АГЕНТ (AGENT) -> ВЕЧНЫЙ КЭШ + WATCHDOG
-        # ------------------------------------------------------------
-    
-        # Выводим сочный лог, чтобы ты глазами видел ID чата в прямом эфире!
-        logger.info(f"POST /v1/chat/completions | Target: [AGENT] (ID: {request_id})")
-
-
-        if PREVIOUS_AGENT_IDS:
-            matched_tokens_len = find_longest_common_token_prefix(PREVIOUS_AGENT_IDS, current_prompt_ids)
-            
-            if matched_tokens_len > 0 and matched_tokens_len < len(PREVIOUS_AGENT_IDS) and matched_tokens_len < len(current_prompt_ids):
-                token_prev = PREVIOUS_AGENT_IDS[matched_tokens_len]
-                token_curr = current_prompt_ids[matched_tokens_len]
-                logger.debug(f"🔍 [CACHE TRACE] Split index: {matched_tokens_len} | Prev Token ID: {token_prev} vs Curr Token ID: {token_curr}")
-
-            cache_drop_size = len(PREVIOUS_AGENT_IDS) - matched_tokens_len
-            if cache_drop_size >= 5000:
-                timestamp = datetime.datetime.now().strftime("%H_%M_%S")
-                file_saved = f"saved_drop_{timestamp}.txt"
-                file_new = f"new_drop_{timestamp}.txt"
-                try:
-                    with open(file_saved, "w", encoding="utf-8") as f: f.write(tokenizer.decode(PREVIOUS_AGENT_IDS))
-                    with open(file_new, "w", encoding="utf-8") as f: f.write(tokenizer.decode(current_prompt_ids))
-                    logger.warning(
-                    f"{C_YELLOW}⚠️ [CRITICAL CACHE DROP] Context collapsed by {cache_drop_size} tokens! "
-                    f"Dumped snapshots: diff {file_saved} {file_new}{C_RESET}"
-                    )
-                except Exception: pass
-
-            if matched_tokens_len > 300:
-                prompt_ids_chunk = current_prompt_ids[matched_tokens_len:]
-                if len(prompt_ids_chunk) == 0:
-
-                    matched_tokens_len -= 1
-                    prompt_ids_chunk = [current_prompt_ids[-1]]
-                
-                if matched_tokens_len < len(PREVIOUS_AGENT_IDS):
-                    for layer_cache in AGENT_CACHE:
-                        if hasattr(layer_cache, "offset"): layer_cache.offset = matched_tokens_len
-                        elif hasattr(layer_cache, "step"): layer_cache.step = matched_tokens_len
-                
-                logger.info(f"🎯 [Cache AGENT Hit] Reused context: {C_GREEN}{matched_tokens_len}{C_RESET} tokens. Evaluating delta remainder: {len(prompt_ids_chunk)} tokens.")
-                PREVIOUS_AGENT_IDS = current_prompt_ids
-                
-                async def agent_hit_stream_wrapper():
-                    try:
-                        async for chunk in async_queue_bridge(model, tokenizer, prompt_ids_chunk, max_tokens, request_id, has_tools, args.prefill_step_size, AGENT_CACHE, args.model, total_prompt_len, None):
-                            yield chunk
-                    finally:
-                        if ASYNC_SERVER_LOCK.locked():
-                            ASYNC_SERVER_LOCK.release()
-                            
-                return StreamingResponse(agent_hit_stream_wrapper(), media_type="text/event-stream")
-
-        logger.info(f"🧹 [Cache AGENT Miss] Full evaluation required: {total_prompt_len} tokens.")
-        AGENT_CACHE = make_persistent_cache()
-        PREVIOUS_AGENT_IDS = current_prompt_ids
-        
-        async def agent_miss_stream_wrapper():
-            try:
-                async for chunk in async_queue_bridge(model, tokenizer, current_prompt_ids, max_tokens, request_id, has_tools, args.prefill_step_size, AGENT_CACHE, args.model, total_prompt_len, None):
-                    yield chunk
-            finally:
-                if ASYNC_SERVER_LOCK.locked():
-                    ASYNC_SERVER_LOCK.release()
-                    
-        return StreamingResponse(agent_miss_stream_wrapper(), media_type="text/event-stream")
-
-    except Exception as e:
-        if ASYNC_SERVER_LOCK and ASYNC_SERVER_LOCK.locked():
-            ASYNC_SERVER_LOCK.release()
-        raise e
+async def _bridge(prompt_ids, max_tokens, r_id, has_tools, cache_obj, total_len):
+    async for chunk in async_queue_bridge(model, tokenizer, prompt_ids, max_tokens, r_id, has_tools, args.prefill_step_size, cache_obj, args.model, total_len, None):
+        yield chunk
+    if ASYNC_SERVER_LOCK.locked(): ASYNC_SERVER_LOCK.release()
 
 @app.get("/v1/context/status")
 async def get_context_status():
-    global PREVIOUS_AGENT_IDS
-    current_len = len(PREVIOUS_AGENT_IDS)
-    # Ярко логируем каждый вызов от хука в консоль нашего сервера
-    logger.info(f"📊 {C_YELLOW}[HOOK API REQUEST]{C_RESET} External watchdog checked context size. Current: {C_GREEN}{current_len}{C_RESET} tokens.")
-    return {"total_prompt_len": current_len}
+    return {"total_prompt_len": len(PREVIOUS_AGENT_IDS)}
 
-
-
-# Запуск Uvicorn
 uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)

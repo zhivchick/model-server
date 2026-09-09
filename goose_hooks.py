@@ -60,11 +60,6 @@ def apply_pre_call_hooks(body: dict) -> tuple:
                 clean_msg["tool_calls"] = hf_calls
         fixed_messages.append(clean_msg)
 
-    if fixed_messages and fixed_messages[-1].get("role") in ["tool", "assistant"]:
-        has_user = any(m.get("role") == "user" for m in fixed_messages)
-        if not has_user or fixed_messages[-1].get("role") == "tool":
-            fixed_messages.append({"role": "user", "content": "Continue and execute the next tool step based on the output above."})
-
     # 🎯 Enforce reasoning suppression across all template layout arguments
     template_kwargs = {
         "tokenize": False,
