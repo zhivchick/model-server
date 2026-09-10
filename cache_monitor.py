@@ -25,14 +25,17 @@ def parse_and_weight_context(raw_text: str, total_tokens_len: int, token_ids_dum
 
     file_segments = []
     text_len = len(raw_text)
-    cmd_pattern = r'\bHeader|\b(?:cat|view_file)\s+([a-zA-Z0-9_\.\/\-\+]+)'
+    # 🎯 ИСПРАВЛЕНO: Убрали grep из детектора выгрузки файлов
+    # 🎯 БРOНЕБOЙНЫЙ ПАТТЕРН: Ловит cat, view_file, а для sed пропускает любые флаги и диапазоны строк ('218,320p')
+    cmd_pattern = r'\b(?:cat|view_file)\s+([a-zA-Z0-9_\.\/\-\+]+)|\bsed\s+.*?\s+([a-zA-Z0-9_\.\/\-\+]+)'
     
     for cmd_match in re.finditer(cmd_pattern, raw_text, re.IGNORECASE):
-        if len(cmd_match.groups()) == 0 or cmd_match.group(1) is None:
-            continue
-        file_path = cmd_match.group(1).strip()
+        # 🎯 ФИКС: Забираем путь либо из первой, либо из второй группы захвата
+        file_path = (cmd_match.group(1) or cmd_match.group(2) or "").strip()
+        
         if len(file_path) <= 3 or not ('.' in file_path or '/' in file_path):
             continue
+
             
         search_start = cmd_match.end()
         response_start = raw_text.find("<tool_response>", search_start)
@@ -62,11 +65,16 @@ def parse_and_weight_context(raw_text: str, total_tokens_len: int, token_ids_dum
     if current_pos < text_len:
         all_segments.append({"name": "prompt / dialogue", "start": current_pos, "end": text_len, "is_file": False, "is_partial": False})
 
+    # ============================================================
+    # 📊 ШАГ 3: ЧЕСТНЫЙ ПОДСЧЁТ ВЕСОВ И ФИЛЬТРАЦИЯ СЛOЁВ (< 500t)
+    # ============================================================
     result_matrix = []
+    
     for seg in all_segments:
         chunk_text = raw_text[seg["start"]:seg["end"]].strip()
         if not chunk_text:
             continue
+            
         if _LOCAL_ENCODER is not None:
             try:
                 seg_tokens = len(_LOCAL_ENCODER.encode(chunk_text, allowed_special="all"))
@@ -76,9 +84,15 @@ def parse_and_weight_context(raw_text: str, total_tokens_len: int, token_ids_dum
             seg_tokens = max(1, len(chunk_text) // 4)
             
         if seg_tokens > 0:
+            # 🎯 ФИКС: Если это диалог и он меньше 500 токенов — просто выкидываем его из списка!
+            # Его вес автоматически улетит в верхний бадж усечения при расчёте в draw_tui
+            if not seg["is_file"] and seg["name"] == "prompt / dialogue" and seg_tokens < 500:
+                continue
+                
             result_matrix.append((seg["name"], seg_tokens, seg["is_file"], seg["is_partial"]))
 
     return result_matrix
+
 
 
 
@@ -199,9 +213,8 @@ def draw_tui(stdscr):
                 stdscr.addstr(2, 0, "+" + "-"*(w-2) + "+")
             except Exception: pass
 
-            # 2. ВЫЧИСЛЕНИЕ ВЕРТИКАЛЬНОЙ ВЫРЕЗКИ И СЕРВЕРНОГО ТРЕКЕРА ПОВТОРОВ
-                        # ============================================================
-            # 🎯 ИСПРАВЛЕННЫЙ РАСЧЁТ ВЕРТИКАЛЬНОЙ РЕЗКИ (БЕЗ ИСЧЕЗНОВЕНИЯ СТРОК)
+       # ============================================================
+            # 🎯 ХИРУРГИЧЕСКИЙ РАСЧЁТ ВЕРХНЕГО БАДЖА (ТОЛЬКО ТО, ЧТО НАВЕРХУ)
             # ============================================================
             max_visible_rows = h - 5
             seen_files_registry = set()
@@ -216,24 +229,23 @@ def draw_tui(stdscr):
                         seen_files_registry.add(name)
                 processed_rows.append((name, tokens, is_file, is_partial, is_duplicate))
 
-            truncated_tokens_sum = 0
-            show_top_truncation_badge = False
-            
-            # 🎯 ФИКС: По умолчанию видимые строки ВСЕГДА равны обработанным!
             visible_rows = processed_rows
+            show_top_truncation_badge = False
+            truncated_tokens_sum = 0
 
-            # Режем историю НАЧАЛА только тогда, когда она РЕАЛЬНО не влезает в экран
+            # Бадж появляется СТРОГО тогда, когда строки физически не влезают в высоту окна!
             if max_visible_rows > 0 and len(processed_rows) > max_visible_rows:
                 show_top_truncation_badge = True
-                # Оставляем одну строку под синий бадж усечения
+                # Определяем точный индекс, по которому режем экран
                 slice_index = len(processed_rows) - max_visible_rows + 1
                 
-                # Суммируем токены улетающих вверх строк (берём строго индекс 1)
+                # 🎯 ЧЕСТНАЯ МАТЕМАТИКА: Суммируем токены СТРОГО тех строк истории (и файлов, и диалогов),
+                # которые физически оказались ВЫШЕ первого отображаемого на экране элемента!
                 for i in range(slice_index):
-                    truncated_tokens_sum += processed_rows[i][1]
+                    truncated_tokens_sum += processed_rows[i] # Индекс 1 — это число токенов
                     
                 visible_rows = processed_rows[slice_index:]
-            # ============================================================
+            # =========================================================
 
 
             # 3. ОТРИСОВКА СПИСКА
@@ -286,21 +298,35 @@ def draw_tui(stdscr):
                 except Exception: pass
                 current_row += 1
 
-            # 4. НИЖНЯЯ РАМКА И ПОДВАЛ APTOP
+              # ============================================================
+            # 🎯 СТИЛЬНЫЙ ASCII-ПОДВАЛ (КНОПКИ ВШИТЫ ПРЯМО В РАМКУ)
+            # ============================================================
             try:
-                stdscr.addstr(h-2, 0, "+" + "-"*(w-2) + "+")
-            except Exception: pass
+                # Базовая нижняя линия
+                base_line = "+" + "-"*(w-2) + "+"
+                
+                # Собираем строку подсказок кнопок
+                hotkeys_str = " ^R:Ref | ^W:Save "
+                if w > 35:
+                    hotkeys_str += "| ^Q:Quit "
+                
+                # Вшиваем подсказки в правую часть нижней рамки, если позволяет ширина
+                if w > len(hotkeys_str) + 6:
+                    # Заменяем дефисы рамки на наши кнопки с отступом в 2 символа справа
+                    pos = w - len(hotkeys_str) - 2
+                    base_line = base_line[:pos] + hotkeys_str + base_line[pos + len(hotkeys_str):]
+                
+                # Отрисовываем монолитную нижнюю рамку на строке h-2
+                # Она теперь сама является и границей, и панелью подсказок!
+                stdscr.addstr(h-2, 0, base_line)
+            except Exception: 
+                pass
+            
+            # Строку h-1 (самый низ экрана) оставляем абсолютно пустой и чистой,
+            # полностью убрав оттуда ломающие addstr/insstr вызовы
+            stdscr.refresh()
 
-            try:
-                stdscr.addstr(h-1, 0, " " * w, curses.color_pair(4))
-                panel_str = " ^R Ref"
-                if w > 18:
-                    panel_str += "   ^W Save"
-                if w > 30:
-                    panel_str += f"{' ' * (w - len(panel_str) - 7)}^Q Quit"
-                safe_panel = panel_str[:w]
-                stdscr.insstr(h-1, 0, safe_panel, curses.color_pair(4))
-            except Exception: pass
+
 
             stdscr.refresh()
 
