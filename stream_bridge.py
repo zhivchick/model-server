@@ -6,7 +6,7 @@ import logging
 import json
 import mlx.core as mx
 from mlx_lm.generate import stream_generate
-from response_formatters import build_streaming_chunk
+from response_formatters import build_streaming_chunk, build_multi_tool_streaming_chunk
 from qwen_xml_parser import QwenXmlParser
 
 from perf_tracker import perf_tracker
@@ -83,20 +83,38 @@ def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id,
                     )
             except StopIteration: return
 
+            # 🎯 ФИКС: ЯВНО ЗАСЕКАЕМ ВРЕМЯ СТАРТА ДЕКОДИРОВАНИЯ
             generation_start_time = time.time()
             logger.debug("Entering main Decoding token stream loop...")
+
+            # Флаги и буфер для потоковой изоляции сырого JSON
+            json_accumulating = False
+            json_buffer = ""
 
             for response in generator_instance:
                 token = response.text
                 full_response_text += token
                 tokens_count += 1
                 
+                # Сценарий Qwen 3.5: нативный XML-парсер
                 in_tool_call = parser.parse_chunk(token) if has_tools else False
                 if in_tool_call:
                     sys.stdout.write(token)
                     sys.stdout.flush()
                     continue
 
+                # Сценарий Qwen 2.5: перехватываем JSON-команды в буфер накопления
+                if has_tools and ("{" in token or "```json" in token or json_accumulating):
+                    if not json_accumulating:
+                        json_accumulating = True
+                        sys.stdout.write("\n⚙️ [JSON INTERCEPT ACTIVE] ")
+                    
+                    json_buffer += token
+                    sys.stdout.write(token)
+                    sys.stdout.flush()
+                    continue
+
+                # Обычный Markdown-текст рассуждений транслируем пользователю в реальном времени
                 sys.stdout.write(token)
                 sys.stdout.flush()
                 
@@ -108,77 +126,113 @@ def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id,
         generation_time = time.time() - generation_start_time
         current_decode_speed = tokens_count / generation_time if generation_time > 0 else 0.0
 
-        # Main stream parsing is done. Now evaluate the firewall state.
-        is_raw_json_tool = False
-        json_tool_name = None
-        json_tool_args = "{}"
         
-        if has_tools and not parser.in_tool_call:
-            start_idx = full_response_text.find("{")
-            if start_idx != -1 and "arguments" in full_response_text:
-                potential_json = full_response_text[start_idx:].strip()
-                if potential_json.endswith("```"):
-                    potential_json = potential_json[:-3].strip()
+               # === НЕУБИВАЕМЫЙ ПОСИМВОЛЬНЫЙ МНОЖЕСТВЕННЫЙ JSON-ПЕРЕХВАТЧИК ===
+        is_raw_json_tool = False
+        json_tool_calls_list = []
+        
+        if has_tools and json_accumulating:
+            
+            # Ищем все честные границы вложенных JSON-объектов через счётчик скобок
+            raw_objects = []
+            brace_count = 0
+            start_pos = -1
+            
+            for pos, char in enumerate(json_buffer):
+                if char == "{":
+                    if brace_count == 0:
+                        start_pos = pos
+                    brace_count += 1
+                elif char == "}":
+                    brace_count -= 1
+                    if brace_count == 0 and start_pos != -1:
+                        # Нашли честный, закрытый со всеми вложениями объект!
+                        raw_objects.append(json_buffer[start_pos:pos+1])
+                        start_pos = -1
+                              
+            for idx, obj_str in enumerate(raw_objects):
+                clean_str = obj_str.strip()
                 try:
-                    parsed_json = json.loads(potential_json)
+                    parsed_json = json.loads(clean_str)
                     if "name" in parsed_json and "arguments" in parsed_json:
                         is_raw_json_tool = True
-                        json_tool_name = parsed_json["name"]
                         args_obj = parsed_json["arguments"]
-                        json_tool_args = json.dumps(args_obj, ensure_ascii=False) if isinstance(args_obj, dict) else str(args_obj)
-                except Exception: pass
+                        
+                        # OpenAI формат требует, чтобы arguments внутри JSON был СТРОКОЙ
+                        if isinstance(args_obj, dict):
+                            stringified_args = json.dumps(args_obj, ensure_ascii=False)
+                        else:
+                            stringified_args = str(args_obj)
+                            
+                        call_payload = {
+                            "index": idx,
+                            "id": f"call_json_{idx}_{int(time.time())}",
+                            "type": "function",
+                            "function": {
+                                "name": parsed_json["name"].strip(),
+                                "arguments": stringified_args
+                            }
+                        }
+                        json_tool_calls_list.append(call_payload)
 
+                except Exception as je:
+                    print(f"⚙️ [DEBUG MULTI-JSON] ❌ Cбой парсинга объекта {idx}: {str(je)}")
+
+        sys.stdout.flush()
+
+
+        # МАРШРУТИЗАЦИЯ И ВЫЗОВ РАДАРА АНТИ-ПЕТЛИ
         if has_tools and (parser.in_tool_call or is_raw_json_tool):
-            if is_raw_json_tool:
-                extracted_args = json.loads(json_tool_args)
-                tool_invocation_name = json_tool_name
+            if is_raw_json_tool and len(json_tool_calls_list) > 0:
+                # Извлекаем первый элемент списка по ИНДЕКСУ, а уже из него берем ["function"]
+                first_call = json_tool_calls_list[0]["function"]
+                tool_invocation_name = first_call["name"]
+                try:
+                    extracted_args = json.loads(first_call["arguments"])
+                except Exception:
+                    extracted_args = {"raw_arguments": first_call["arguments"]}
             else:
                 extracted_args = _parse_xml_arguments(full_response_text)
                 tool_invocation_name = parser.tool_name
-                
-            # 🔍 Вызываем радар файрвола (возвращает строго 2 элемента)
+
+
+            sys.stdout.flush()
+            
             t_name, t_args = anti_loop_engine.evaluate_and_process(full_response_text, tool_invocation_name, extracted_args)
             
-            # 🎯 1. АБСОЛЮТНЫЙ ВЫЛЕТ НА ЮЗЕРА (Попытка 6, hit_count >= 5)
+            # 🎯 Сценарий 1. Жесткий вылет по повторам
             if t_name is None:
                 asyncio.run_coroutine_threadsafe(
-                    queue.put(build_streaming_chunk(
-                        request_id=request_id, model_name=model_name, 
-                        content=f"\n\n🛑 {t_args}\n", finish_reason="stop", 
-                        prompt_len=prompt_tokens_len, completion_len=tokens_count
-                    )), loop
+                    queue.put(build_streaming_chunk(request_id=request_id, model_name=model_name, content=f"\n\n🛑 {t_args}\n", finish_reason="stop", prompt_len=prompt_tokens_len, completion_len=tokens_count)), loop
                 )
-            # 🎯 2. ШТАТНЫЙ ХОД (Для всех витков и обычного Chaining)
+            # 🎯 Сценарий 2. Штатный ход
             elif t_name == tool_invocation_name:
-                asyncio.run_coroutine_threadsafe(
-                    queue.put(build_streaming_chunk(
-                        request_id=request_id, model_name=model_name, finish_reason="stop", 
-                        prompt_len=prompt_tokens_len, completion_len=tokens_count
-                    )), loop
-                )
-            # 🎯 3. ПОДМЕНА ОТВЕТОВ ТУЛОВ НА РАННИХ ЭТАПАХ ПОДМЕНЫ
+                if is_raw_json_tool:
+                    raw_chunk = build_multi_tool_streaming_chunk(request_id=request_id, model_name=model_name, tool_calls_list=json_tool_calls_list, prompt_len=prompt_tokens_len, completion_len=tokens_count)
+                    
+                    asyncio.run_coroutine_threadsafe(
+                        queue.put(raw_chunk), loop
+                    )
+                else:
+                    asyncio.run_coroutine_threadsafe(
+                        queue.put(build_streaming_chunk(request_id=request_id, model_name=model_name, finish_reason="stop", prompt_len=prompt_tokens_len, completion_len=tokens_count)), loop
+                    )
+            # 🎯 Сценарий 3. Подмена ответа шелла
             else:
                 asyncio.run_coroutine_threadsafe(
-                    queue.put(build_streaming_chunk(
-                        request_id=request_id, model_name=model_name, tool_name=t_name, tool_args=t_args, 
-                        finish_reason="tool_calls", prompt_len=prompt_tokens_len, completion_len=tokens_count
-                    )), loop
+                    queue.put(build_streaming_chunk(request_id=request_id, model_name=model_name, tool_name=t_name, tool_args=t_args, finish_reason="tool_calls", prompt_len=prompt_tokens_len, completion_len=tokens_count)), loop
                 )
 
         else:
-            # Обычный текстовый ответ без инструментов
             asyncio.run_coroutine_threadsafe(
-                queue.put(build_streaming_chunk(
-                    request_id=request_id, model_name=model_name, finish_reason="stop", 
-                    prompt_len=prompt_tokens_len, completion_len=tokens_count
-                )), loop
+                queue.put(build_streaming_chunk(request_id=request_id, model_name=model_name, finish_reason="stop", prompt_len=prompt_tokens_len, completion_len=tokens_count)), loop
             )
             
+
         perf_tracker.record_metrics(
             current_prefill_speed, current_decode_speed, 
             total_context_len=prompt_tokens_len, prompt_chunk_len=chunk_len, completion_len=tokens_count
         )
-
 
     except Exception as e:
         logger.exception(f"Critical exception inside GPU worker execution loop: {str(e)}")
@@ -186,6 +240,9 @@ def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id,
         asyncio.run_coroutine_threadsafe(queue.put(None), loop)
         logger.info(f"[GPU RELEASED] Request {request_id} execution finalized.")
         print("-" * 60)
+
+
+
 
 async def async_queue_bridge(model, tokenizer, prompt_ids, max_tokens, request_id, has_tools, prefill_step_size, global_cache, model_name, prompt_tokens_len, server_lock):
     from starlette.concurrency import run_in_threadpool

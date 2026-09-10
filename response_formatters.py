@@ -73,3 +73,29 @@ def build_monolithic_response(text: str, model_name: str, tool_name: str = None,
         "model": model_name,
         "choices": choices
     }
+
+def build_multi_tool_streaming_chunk(request_id: str, model_name: str, tool_calls_list: list, prompt_len: int = 0, completion_len: int = 0) -> str:
+    """Упаковывает массив перехваченных JSON-инструментов в легитимный пакет для Goose OpenAI провайдера."""
+    chunk = {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model_name,
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "role": "assistant",
+                "tool_calls": tool_calls_list
+            },
+            "finish_reason": "tool_calls" # Фиксируем жестко, убирая битую переменную
+        }]
+    }
+    
+    # Инжектируем usage-метрики для синхронизации трекера Goose
+    if prompt_len > 0:
+        chunk["usage"] = {
+            "prompt_tokens": prompt_len,
+            "completion_tokens": completion_len,
+            "total_tokens": prompt_len + completion_len
+        }
+    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"

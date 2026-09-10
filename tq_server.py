@@ -73,7 +73,7 @@ async def chat_completions(request: Request):
         if ASYNC_SERVER_LOCK.locked(): ASYNC_SERVER_LOCK.release()
         raise e
 
-# ------------------------------------------------------------
+## ------------------------------------------------------------
 # 🧠 ИЗОЛИРОВАННЫЕ ПРОЦЕДУРЫ ОБРАБОТКИ КОНТЕКСТА
 # ------------------------------------------------------------
 def _apply_hardware_time_lock(messages: list) -> list:
@@ -88,16 +88,22 @@ def _apply_hardware_time_lock(messages: list) -> list:
 
 def _render_and_tokenize(messages: list, template_kwargs: dict) -> tuple:
     """Применяет Jinja-шаблон строго 1 раз и кодирует без скрытых токенов BOS."""
+    global LAST_LIVE_RAW_TEXT
+    
+    # Генерируем чистую строку из уже замороженных сообщений
     full_prompt_string = tokenizer.apply_chat_template(messages, **template_kwargs)
+   
+    # 🎯 ЕДИНСТВЕННАЯ НУЖНАЯ ПРАВКА: Просто прокидываем её в RAM-переменную для TUI
+    LAST_LIVE_RAW_TEXT = full_prompt_string
+
+    # Кодируем в ID для Apple Metal кэша
     current_prompt_ids = tokenizer.encode(full_prompt_string, add_special_tokens=False)
     return current_prompt_ids, len(current_prompt_ids)
 
+
+
 def _print_pipeline_telemetry(request_id: str, is_agent: bool, total_prompt_len: int):
     """Выводит плоскую карту координат промпта в консоль."""
-    print(f"\n{'='*20} PROMPT DATA {'='*20}")
-    print(f"Request: {request_id} | Mode: {'[AGENT]' if is_agent else '[UTILITY]'} | Tokens: {total_prompt_len}")
-    print(f"{'='*53}\n")
-    import sys; sys.stdout.flush()
 
 # ------------------------------------------------------------
 # ⚡ ИЗОЛИРОВАННЫЕ СЦЕНАРИИ КЭШИРОВАНИЯ И ИНФЕРЕНСА
@@ -131,6 +137,22 @@ def _handle_agent_scenarios(current_prompt_ids: list, total_prompt_len: int, req
 
     if PREVIOUS_AGENT_IDS:
         matched_tokens_len = _find_prefix(PREVIOUS_AGENT_IDS, current_prompt_ids)
+
+        cache_drop_size = len(PREVIOUS_AGENT_IDS) - matched_tokens_len
+        if cache_drop_size >= 5000:
+                timestamp = datetime.datetime.now().strftime("%H_%M_%S")
+                file_saved = f"saved_drop_{timestamp}.txt"
+                file_new = f"new_drop_{timestamp}.txt"
+                try:
+                    with open(file_saved, "w", encoding="utf-8") as f: f.write(tokenizer.decode(PREVIOUS_AGENT_IDS))
+                    with open(file_new, "w", encoding="utf-8") as f: f.write(tokenizer.decode(current_prompt_ids))
+                    logger.warning(
+                    f"{C_YELLOW}⚠️ [CRITICAL CACHE DROP] Context collapsed by {cache_drop_size} tokens! "
+                    f"Dumped snapshots: diff {file_saved} {file_new}{C_RESET}"
+                    )
+                except Exception: pass
+
+
         if matched_tokens_len > 300:
             prompt_ids_chunk = current_prompt_ids[matched_tokens_len:]
             # 🎯 ЗАЩИТА ОТ VALUEERROR: Если дельта пустая, откатываемся на 1 токен назад
@@ -179,6 +201,24 @@ async def _bridge(prompt_ids, max_tokens, r_id, has_tools, cache_obj, total_len)
 
 @app.get("/v1/context/status")
 async def get_context_status():
-    return {"total_prompt_len": len(PREVIOUS_AGENT_IDS)}
+    global PREVIOUS_AGENT_IDS
+    current_len = len(PREVIOUS_AGENT_IDS)
+    # Ярко логируем каждый вызов от хука в консоль нашего сервера
+    logger.info(f"📊 {C_YELLOW}[HOOK API REQUEST]{C_RESET} External watchdog checked context size. Current: {C_GREEN}{current_len}{C_RESET} tokens.")
+    return {"total_prompt_len": current_len}
+
+@app.get("/v1/context/raw")
+async def get_raw_context():
+    """
+    🎯 СТЕРЕЛЬНЫЙ ЭНДПОИНТ: Отдает только чистую правду из RAM.
+    0% влияния на Metal-граф, 100% защита от слетов кэша.
+    """
+    global PREVIOUS_AGENT_IDS, LAST_LIVE_RAW_TEXT
+    
+    return {
+        "total_tokens_len": len(PREVIOUS_AGENT_IDS), # Число для шапки монитора
+        "raw_text": LAST_LIVE_RAW_TEXT or ""        # Текст для локального распила
+    }
+
 
 uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
