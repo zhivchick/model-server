@@ -1,11 +1,12 @@
+import os
 import httpx
 import logging
 
 logger = logging.getLogger("mlx_lm_server.killer")
 
 # Настройки подключения к твоему TLS-серверу Goose
-ACP_SERVER_URL = "https://127.0.0.1:3000"
-SECRET_KEY = "YOUR_SECRET"
+ACP_SERVER_URL = os.getenv("ACP_SERVER_URL", "https://127.0.0.1:3000")
+SECRET_KEY = os.getenv("GOOSE_SECRET_KEY", "YOUR_SECRET")
 
 async def trigger_goose_compaction_break(session_id: str):
     """

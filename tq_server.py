@@ -39,6 +39,7 @@ AGENT_CACHE = [mlx_lm.models.cache.KVCache() for _ in range(32)] # Ленива�
 PREVIOUS_AGENT_IDS = []
 COMPACTION_CACHE = [mlx_lm.models.cache.KVCache() for _ in range(32)]
 PREVIOUS_COMPACTION_IDS = []
+LAST_LIVE_RAW_TEXT = ""
 ASYNC_SERVER_LOCK = asyncio.Lock()
 
 app = FastAPI()
@@ -104,6 +105,7 @@ def _render_and_tokenize(messages: list, template_kwargs: dict) -> tuple:
 
 def _print_pipeline_telemetry(request_id: str, is_agent: bool, total_prompt_len: int):
     """Выводит плоскую карту координат промпта в консоль."""
+    logger.info(f"📍 [PIPELINE] req={request_id} target={'AGENT' if is_agent else 'UTILITY'} prompt_len={total_prompt_len}")
 
 # ------------------------------------------------------------
 # ⚡ ИЗОЛИРОВАННЫЕ СЦЕНАРИИ КЭШИРОВАНИЯ И ИНФЕРЕНСА
@@ -195,9 +197,12 @@ def _shift_cache_offset(cache_registry: list, offset_val: int):
         elif hasattr(layer, "step"): layer.step = offset_val
 
 async def _bridge(prompt_ids, max_tokens, r_id, has_tools, cache_obj, total_len):
-    async for chunk in async_queue_bridge(model, tokenizer, prompt_ids, max_tokens, r_id, has_tools, args.prefill_step_size, cache_obj, args.model, total_len, None):
-        yield chunk
-    if ASYNC_SERVER_LOCK.locked(): ASYNC_SERVER_LOCK.release()
+    try:
+        async for chunk in async_queue_bridge(model, tokenizer, prompt_ids, max_tokens, r_id, has_tools, args.prefill_step_size, cache_obj, args.model, total_len, None):
+            yield chunk
+    finally:
+        if ASYNC_SERVER_LOCK.locked():
+            ASYNC_SERVER_LOCK.release()
 
 @app.get("/v1/context/status")
 async def get_context_status():

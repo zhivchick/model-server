@@ -242,7 +242,7 @@ def draw_tui(stdscr):
                 # 🎯 ЧЕСТНАЯ МАТЕМАТИКА: Суммируем токены СТРОГО тех строк истории (и файлов, и диалогов),
                 # которые физически оказались ВЫШЕ первого отображаемого на экране элемента!
                 for i in range(slice_index):
-                    truncated_tokens_sum += processed_rows[i] # Индекс 1 — это число токенов
+                    truncated_tokens_sum += processed_rows[i][1] # Индекс 1 — это число токенов
                     
                 visible_rows = processed_rows[slice_index:]
             # =========================================================

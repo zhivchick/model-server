@@ -215,7 +215,7 @@ def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id,
                     )
                 else:
                     asyncio.run_coroutine_threadsafe(
-                        queue.put(build_streaming_chunk(request_id=request_id, model_name=model_name, finish_reason="stop", prompt_len=prompt_tokens_len, completion_len=tokens_count)), loop
+                        queue.put(build_streaming_chunk(request_id=request_id, model_name=model_name, tool_name=t_name, tool_args=t_args, finish_reason="tool_calls", prompt_len=prompt_tokens_len, completion_len=tokens_count)), loop
                     )
             # 🎯 Сценарий 3. Подмена ответа шелла
             else:
