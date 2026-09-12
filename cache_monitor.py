@@ -6,7 +6,7 @@ import os
 
 # ⚙️ НАСТРОЙКИ МОНИТОРА
 SERVER_URL = "http://127.0.0.1:8080/v1/context/raw"
-REFRESH_INTERVAL_SEC = 10
+REFRESH_INTERVAL_SEC = 30
 SAVE_DUMP_PATH = "goose_live_context_dump.txt"  # 💾 Путь для сохранения по Ctrl+S
 # Добавьте импорт на самый верх cache_monitor.py
 try:
