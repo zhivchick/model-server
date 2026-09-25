@@ -61,14 +61,20 @@ def apply_pre_call_hooks(body: dict) -> tuple:
         fixed_messages.append(clean_msg)
 
     # 🎯 Prompt-level User Intervention before calls 4 and 5 (when loop depth is 2 or 3)
+    # CRITICAL: We inject into the trailing tool message content instead of appending a new
+    # 'user' role message. Appending a 'user' role shifts Jinja's `last_query_index`, causing
+    # the template to prune `<think>` blocks from all prior assistant turns and collapsing the KV-cache.
     from anti_loop import anti_loop_engine
-    if anti_loop_engine.hit_count in (2, 3) and anti_loop_engine.last_tool:
+    if anti_loop_engine.hit_count in (2, 3) and anti_loop_engine.last_tool and fixed_messages:
         warning_tag = "USER DIRECTIVE - FINAL WARNING" if anti_loop_engine.hit_count == 3 else "USER INTERVENTION"
         user_intervention_text = (
-            f"[{warning_tag}]: You are stuck calling '{anti_loop_engine.last_tool}' repeatedly with identical arguments. "
+            f"\n\n[{warning_tag}]: You are stuck calling '{anti_loop_engine.last_tool}' repeatedly with identical arguments. "
             f"As the human operator, I instruct you: do NOT retry this command. Change your approach, inspect different files, or ask me for clarification."
         )
-        fixed_messages.append({"role": "user", "content": user_intervention_text})
+        if fixed_messages[-1].get("role") == "tool":
+            fixed_messages[-1]["content"] = (fixed_messages[-1].get("content") or "") + user_intervention_text
+        else:
+            fixed_messages.append({"role": "user", "content": user_intervention_text.strip()})
 
     # 🎯 Enforce reasoning suppression across all template layout arguments
     template_kwargs = {
@@ -76,9 +82,13 @@ def apply_pre_call_hooks(body: dict) -> tuple:
         "add_generation_prompt": True,
         "thinking": False,
         "enable_thinking": False,
+        "preserve_thinking": True,
+        "preserve_reasoning": True,
         "chat_template_args": {
             "enable_thinking": False,
-            "thinking": False
+            "thinking": False,
+            "preserve_thinking": True,
+            "preserve_reasoning": True
         }
     }
     

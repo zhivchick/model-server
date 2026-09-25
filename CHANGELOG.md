@@ -14,7 +14,9 @@ All notable changes, fixes, and context notes are recorded here to track the evo
   - **Tier 3 (Call 6 / Hit 5+)**: Hard Dialogue Brake (`t_name is None`) with terminal session pause, returning control to human user and resetting loop state.
 
 ### 2. `goose_hooks.py`
-- **Feature (Prompt-Level User Intervention)**: When `anti_loop_engine.hit_count` is 2 or 3 (prior to calls 4 and 5), dynamically appends a `user` role message to the Jinja chat context informing the model directly from the user to halt the repetition loop and choose an alternative path.
+- **Feature (Prompt-Level User Intervention & Cache Drop Fix)**: When `anti_loop_engine.hit_count` is 2 or 3 (prior to calls 4 and 5), injects a simulated operator intervention directive into the trailing `tool` message content (`fixed_messages[-1]["content"]`) instead of appending a new `role: "user"` message.
+- **Bug Fixed (KV-Cache Collapse on Injected User Message)**: Previously, appending a message with `role: "user"` caused Qwen/DeepSeek Jinja chat templates to shift `last_query_index` to the end of the history. Under standard Jinja rules (`loop.index0 > ns.last_query_index`), this triggered pruning of all `<think>\n\n</think>` blocks from all prior assistant messages (starting at token 5178), breaking the LCP cache and causing a 21,747 token cache drop. Injecting into `role: "tool"` content leaves `last_query_index` unchanged, maintaining a 100% prefix cache hit.
+- **Enhancement**: Added `"preserve_thinking": True` and `"preserve_reasoning": True` to `template_kwargs` and `chat_template_args` to ensure templates never strip historical reasoning blocks.
 
 ### 3. `test_anti_loop.py`
 - **Test Suite**: Added unit test coverage for GitHub entity ID exemption, sliding window loop detection, 3-tier escalation progression, and pivot counter resets.

@@ -119,9 +119,10 @@ class TestAntiLoopSuite(unittest.TestCase):
         }
 
         fixed_messages, kwargs = apply_pre_call_hooks(body)
-        self.assertEqual(fixed_messages[-1]["role"], "user")
+        self.assertEqual(fixed_messages[-1]["role"], "tool")
         self.assertIn("[USER INTERVENTION]", fixed_messages[-1]["content"])
         self.assertIn("developer__edit", fixed_messages[-1]["content"])
+        self.assertTrue(kwargs.get("preserve_thinking"))
 
 if __name__ == "__main__":
     unittest.main()
