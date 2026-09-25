@@ -60,6 +60,16 @@ def apply_pre_call_hooks(body: dict) -> tuple:
                 clean_msg["tool_calls"] = hf_calls
         fixed_messages.append(clean_msg)
 
+    # 🎯 Prompt-level User Intervention before calls 4 and 5 (when loop depth is 2 or 3)
+    from anti_loop import anti_loop_engine
+    if anti_loop_engine.hit_count in (2, 3) and anti_loop_engine.last_tool:
+        warning_tag = "USER DIRECTIVE - FINAL WARNING" if anti_loop_engine.hit_count == 3 else "USER INTERVENTION"
+        user_intervention_text = (
+            f"[{warning_tag}]: You are stuck calling '{anti_loop_engine.last_tool}' repeatedly with identical arguments. "
+            f"As the human operator, I instruct you: do NOT retry this command. Change your approach, inspect different files, or ask me for clarification."
+        )
+        fixed_messages.append({"role": "user", "content": user_intervention_text})
+
     # 🎯 Enforce reasoning suppression across all template layout arguments
     template_kwargs = {
         "tokenize": False,
