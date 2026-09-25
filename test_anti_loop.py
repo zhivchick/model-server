@@ -133,41 +133,47 @@ class TestAntiLoopSuite(unittest.TestCase):
         self.assertEqual(engine.hit_count, 0)
         self.assertFalse(engine.is_fuzzy_mode)
 
-        # Call 2: sliding window sed 11,20p -> pass (attempt 1/6: grace attempt allowed!)
-        t2, a2 = engine.evaluate_and_process("", tool, {"command": "sed -n '11,20p' file.go"})
-        self.assertEqual(t2, "shell")
-        self.assertEqual(engine.hit_count, 1)
-        self.assertTrue(engine.is_fuzzy_mode)
-        self.assertIn("sed -n '11,20p'", a2, "First sliding shift must pass through unmodified!")
+        # Calls 2..6: 5 free sliding shifts (grace shifts 1..5) -> ALL MUST PASS!
+        for i in range(1, 6):
+            start = i * 10 + 1
+            end = (i + 1) * 10
+            cmd = f"sed -n '{start},{end}p' file.go"
+            t, a = engine.evaluate_and_process("", tool, {"command": cmd})
+            self.assertEqual(t, "shell")
+            self.assertEqual(engine.hit_count, i)
+            self.assertTrue(engine.is_fuzzy_mode)
+            self.assertIn(cmd, a, f"Grace shift {i}/5 must pass through unmodified!")
 
-        # Call 3: sliding window sed 21,30p -> hit 2/6: echo error
-        t3, a3 = engine.evaluate_and_process("", tool, {"command": "sed -n '21,30p' file.go"})
-        self.assertEqual(t3, "shell")
-        self.assertEqual(engine.hit_count, 2)
-        self.assertIn("Execution Error", a3)
-
-        # Call 4: sliding window sed 31,40p -> hit 3/6: echo error
-        t4, a4 = engine.evaluate_and_process("", tool, {"command": "sed -n '31,40p' file.go"})
-        self.assertEqual(t4, "shell")
-        self.assertEqual(engine.hit_count, 3)
-        self.assertIn("Execution Error", a4)
-
-        # Call 5: sliding window sed 41,50p -> hit 4/6: user intervention
-        t5, a5 = engine.evaluate_and_process("", tool, {"command": "sed -n '41,50p' file.go"})
-        self.assertEqual(t5, "shell")
-        self.assertEqual(engine.hit_count, 4)
-        self.assertIn("[USER INTERVENTION]", a5)
-
-        # Call 6: sliding window sed 51,60p -> hit 5/6: user directive final warning
-        t6, a6 = engine.evaluate_and_process("", tool, {"command": "sed -n '51,60p' file.go"})
-        self.assertEqual(t6, "shell")
-        self.assertEqual(engine.hit_count, 5)
-        self.assertIn("[USER DIRECTIVE - FINAL WARNING]", a6)
-
-        # Call 7: sliding window sed 61,70p -> hit 6/6: hard dialogue brake
+        # Call 7: sliding shift 6 -> hit 6/10: echo error with sliding window explanation!
         t7, a7 = engine.evaluate_and_process("", tool, {"command": "sed -n '61,70p' file.go"})
-        self.assertIsNone(t7, "Hard threshold at 6/6 must brake the dialogue!")
-        self.assertIn("Critical repetition loop detected", a7)
+        self.assertEqual(t7, "shell")
+        self.assertEqual(engine.hit_count, 6)
+        self.assertIn("Sliding window read limit reached", a7)
+        self.assertIn("micro-paginate", a7)
+
+        # Call 8: sliding shift 7 -> hit 7/10: echo error persistent
+        t8, a8 = engine.evaluate_and_process("", tool, {"command": "sed -n '71,80p' file.go"})
+        self.assertEqual(t8, "shell")
+        self.assertEqual(engine.hit_count, 7)
+        self.assertIn("Persistent sliding window pagination", a8)
+
+        # Call 9: sliding shift 8 -> hit 8/10: user intervention
+        t9, a9 = engine.evaluate_and_process("", tool, {"command": "sed -n '81,90p' file.go"})
+        self.assertEqual(t9, "shell")
+        self.assertEqual(engine.hit_count, 8)
+        self.assertIn("[USER INTERVENTION]", a9)
+        self.assertIn("micro-paginating", a9)
+
+        # Call 10: sliding shift 9 -> hit 9/10: user directive final warning
+        t10, a10 = engine.evaluate_and_process("", tool, {"command": "sed -n '91,100p' file.go"})
+        self.assertEqual(t10, "shell")
+        self.assertEqual(engine.hit_count, 9)
+        self.assertIn("[USER DIRECTIVE - FINAL WARNING]", a10)
+
+        # Call 11: sliding shift 10 -> hit 10/10: hard dialogue brake
+        t11, a11 = engine.evaluate_and_process("", tool, {"command": "sed -n '101,110p' file.go"})
+        self.assertIsNone(t11, "Hard threshold at 10/10 must brake the dialogue!")
+        self.assertIn("Critical repetition loop detected", a11)
         self.assertEqual(engine.hit_count, 0)
         self.assertFalse(engine.is_fuzzy_mode)
 

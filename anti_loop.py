@@ -25,21 +25,28 @@ class AntiLoopEngine:
         Возвращает (step_label, warning_tag, user_intervention_text) если текущее состояние
         требует внедрения сообщения от имени пользователя в контекст, иначе None.
         Для exact-повторов: шаги 3/5 и 4/5 (при hit_count 2 и 3).
-        Для fuzzy-повторов: шаги 4/6 и 5/6 (при hit_count 3 и 4).
+        Для fuzzy-повторов (5 бесплатных сдвигов): шаги 8/10 и 9/10 (при hit_count 7 и 8).
         """
         if not self.last_tool:
             return None
-        total_steps = 6 if self.is_fuzzy_mode else 5
-        target_hits = (3, 4) if self.is_fuzzy_mode else (2, 3)
+        total_steps = 10 if self.is_fuzzy_mode else 5
+        target_hits = (7, 8) if self.is_fuzzy_mode else (2, 3)
         if self.hit_count in target_hits:
             is_final = (self.hit_count == target_hits[1])
-            step_current = (5 if is_final else 4) if self.is_fuzzy_mode else (4 if is_final else 3)
+            step_current = (9 if is_final else 8) if self.is_fuzzy_mode else (4 if is_final else 3)
             step_label = f"{step_current}/{total_steps}"
             warning_tag = "USER DIRECTIVE - FINAL WARNING" if is_final else "USER INTERVENTION"
-            user_intervention_text = (
-                f"[{warning_tag}]: You are stuck calling '{self.last_tool}' repeatedly with identical arguments. "
-                f"As the human operator, I instruct you: do NOT retry this command. Change your approach, inspect different files, or ask me for clarification."
-            )
+            if self.is_fuzzy_mode:
+                user_intervention_text = (
+                    f"[{warning_tag}]: You are stuck micro-paginating and shifting line ranges with '{self.last_tool}'. "
+                    f"As the human operator, I instruct you: do NOT continue reading in small slices. "
+                    f"Inspect the required section or file in a single call (e.g. via 'cat' or 'grep -n') or ask me for clarification."
+                )
+            else:
+                user_intervention_text = (
+                    f"[{warning_tag}]: You are stuck calling '{self.last_tool}' repeatedly with identical arguments. "
+                    f"As the human operator, I instruct you: do NOT retry this exact command. Change your approach, inspect different files, or ask me for clarification."
+                )
             return step_label, warning_tag, user_intervention_text
         return None
 
@@ -112,6 +119,8 @@ class AntiLoopEngine:
             "byte-for-byte identical",
             "matches multiple lines",
             "ambiguity loop",
+            "sliding window",
+            "micro-paginate",
         ]
 
         for text in cmd_candidates:
@@ -191,12 +200,12 @@ class AntiLoopEngine:
             self.last_raw_args = raw_args_str
             self.last_skeleton = current_skeleton
 
-            total_steps = 6 if self.is_fuzzy_mode else 5
+            total_steps = 10 if self.is_fuzzy_mode else 5
 
-            # 🌟 НЕЧЕТКИЙ ПОВТОР (SLIDING WINDOW): Шаг 1/6 пропускаем без блокировки (даем дойти до цели)!
-            if self.is_fuzzy_mode and self.hit_count == 1:
+            # 🌟 НЕЧЕТКИЙ ПОВТОР (SLIDING WINDOW): Первые 5 сдвигов пропускаем без блокировки (даем дойти до цели)!
+            if self.is_fuzzy_mode and self.hit_count <= 5:
                 logger.info(
-                    f"{C_GREEN}ℹ️ [SLIDING WINDOW - 1/6] Тул '{tool_name}' сдвинул параметры/окно. Пропускаем выполнение (попытка 1/6).{C_RESET}"
+                    f"{C_GREEN}ℹ️ [SLIDING WINDOW - {self.hit_count}/{total_steps}] Тул '{tool_name}' сдвинул параметры/окно (сдвиг {self.hit_count}/5). Пропускаем выполнение.{C_RESET}"
                 )
                 return tool_name, final_json_args
 
@@ -219,29 +228,41 @@ class AntiLoopEngine:
 
             forced_tool_name = "shell"
 
-            # 👤 ЭШЕЛОН 2: ВМЕШАТЕЛЬСТВО ЮЗЕРА (Exact: 3/5 и 4/5, Fuzzy: 4/6 и 5/6)
-            user_step = 4 if self.is_fuzzy_mode else 3
-            directive_step = 5 if self.is_fuzzy_mode else 4
+            # 👤 ЭШЕЛОН 2: ВМЕШАТЕЛЬСТВО ЮЗЕРА (Exact: 3/5 и 4/5, Fuzzy: 8/10 и 9/10)
+            user_step = 8 if self.is_fuzzy_mode else 3
+            directive_step = 9 if self.is_fuzzy_mode else 4
 
             if self.hit_count == user_step:
                 logger.error(
                     f"{C_BOLD}{C_CYAN}👤 [USER INTERVENTION - {user_step}/{total_steps}] Тул '{tool_name}' повторен {user_step}-й раз. Модель проигнорировала подсказку. Отклоняем payload с [USER INTERVENTION].{C_RESET}"
                 )
-                payload_text = (
-                    f"[USER INTERVENTION]: Stop! You have called the tool \"{tool_name}\" {user_step} times in a row with identical parameters without making progress. "
-                    f"I am intervening directly as the user: do NOT retry this exact command. "
-                    f"Analyze the previous outputs, change your strategy, or ask me for clarification."
-                )
+                if self.is_fuzzy_mode:
+                    payload_text = (
+                        f"[USER INTERVENTION]: Stop! You have been shifting line ranges and micro-paginating repeatedly without making progress. "
+                        f"Stop reading the file in small slices. Inspect the required file or block at once (e.g. via 'cat' or 'grep -n') or ask me for clarification."
+                    )
+                else:
+                    payload_text = (
+                        f"[USER INTERVENTION]: Stop! You have called the tool \"{tool_name}\" {user_step} times in a row with identical parameters without making progress. "
+                        f"I am intervening directly as the user: do NOT retry this exact command. "
+                        f"Analyze the previous outputs, change your strategy, or ask me for clarification."
+                    )
             elif self.hit_count == directive_step:
                 logger.error(
                     f"{C_BOLD}{C_RED}👤 [USER DIRECTIVE - {directive_step}/{total_steps}] Тул '{tool_name}' повторен {directive_step}-й раз. Финальное предупреждение перед аварийным стопом {total_steps}/{total_steps}. Отклоняем payload.{C_RESET}"
                 )
-                payload_text = (
-                    f"[USER DIRECTIVE - FINAL WARNING]: You are ignoring instructions and still attempting to call \"{tool_name}\". "
-                    f"This is your final warning: do NOT invoke \"{tool_name}\" again with these arguments. "
-                    f"Summarize what is blocking you or switch to an entirely different approach now, or the session will be terminated."
-                )
-            # 🛠️ ЭШЕЛОН 1: ПОДМЕНА ОТВЕТА ТУЛА (Exact: 1/5 и 2/5, Fuzzy: 2/6 и 3/6)
+                if self.is_fuzzy_mode:
+                    payload_text = (
+                        f"[USER DIRECTIVE - FINAL WARNING]: You are ignoring instructions and still attempting to micro-paginate with \"{tool_name}\". "
+                        f"Read the whole block at once or switch to an entirely different approach now, or the session will be terminated."
+                    )
+                else:
+                    payload_text = (
+                        f"[USER DIRECTIVE - FINAL WARNING]: You are ignoring instructions and still attempting to call \"{tool_name}\". "
+                        f"This is your final warning: do NOT invoke \"{tool_name}\" again with these arguments. "
+                        f"Summarize what is blocking you or switch to an entirely different approach now, or the session will be terminated."
+                    )
+            # 🛠️ ЭШЕЛОН 1: ПОДМЕНА ОТВЕТА ТУЛА (Exact: 1/5 и 2/5, Fuzzy: 6/10 и 7/10)
             elif is_idle_edit:
                 logger.warning(f"{C_YELLOW}⚠️ [ANTI-LOOP FIREWALL] Повтор {self.hit_count}/{total_steps}: Идентичные before/after у '{tool_name}'. Отклоняем payload с ошибкой.{C_RESET}")
                 payload_text = (
@@ -250,7 +271,7 @@ class AntiLoopEngine:
                 )
             elif is_edit_tool:
                 logger.warning(f"{C_YELLOW}⚠️ [ANTI-LOOP FIREWALL] Повтор {self.hit_count}/{total_steps}: Зацикливание правки '{tool_name}'. Внедряем подсказку расширить контекст.{C_RESET}")
-                first_echo_hit = 2 if self.is_fuzzy_mode else 1
+                first_echo_hit = 6 if self.is_fuzzy_mode else 1
                 if self.hit_count == first_echo_hit:
                     payload_text = (
                         "Execution Error: The block you provided in the \"before\" parameter matches multiple lines in the file. "
@@ -263,20 +284,33 @@ class AntiLoopEngine:
                         "(at least 3-5 unique lines above and below) or inspect the file with a read tool first."
                     )
             else:
-                first_echo_hit = 2 if self.is_fuzzy_mode else 1
-                second_echo_hit = 3 if self.is_fuzzy_mode else 2
+                first_echo_hit = 6 if self.is_fuzzy_mode else 1
+                second_echo_hit = 7 if self.is_fuzzy_mode else 2
                 escalation_hint = f" (Внимание: следующий повтор {user_step}/{total_steps} подключит оператора [USER INTERVENTION])" if self.hit_count == second_echo_hit else ""
                 logger.warning(f"{C_YELLOW}⚠️ [ANTI-LOOP FIREWALL] Повтор {self.hit_count}/{total_steps}: Тул '{tool_name}' вызван повторно. Подменяем ответ тула на Execution Error.{escalation_hint}{C_RESET}")
-                if self.hit_count == first_echo_hit:
-                    payload_text = (
-                        f"Execution Error: The tool \"{tool_name}\" called multiple times with the same parameters. "
-                        f"Change parameters or use another tool to continue."
-                    )
+                if self.is_fuzzy_mode:
+                    if self.hit_count == first_echo_hit:
+                        payload_text = (
+                            f"Execution Error: Sliding window read limit reached for tool \"{tool_name}\". "
+                            f"You have shifted parameters/line ranges 5+ times in small increments. "
+                            f"Do NOT micro-paginate: inspect the required section or file in a single call (e.g. using 'cat' or 'grep -n') or switch your strategy."
+                        )
+                    else:
+                        payload_text = (
+                            f"Execution Error: Persistent sliding window pagination on tool \"{tool_name}\". "
+                            f"Stop querying this file in small slices. Inspect the required block in a single call or pivot your approach."
+                        )
                 else:
-                    payload_text = (
-                        f"Execution Error: Repeated call signature confirmed for tool \"{tool_name}\". "
-                        f"Your previous call produced identical results. Pivot your command or inspect other files to proceed."
-                    )
+                    if self.hit_count == first_echo_hit:
+                        payload_text = (
+                            f"Execution Error: The tool \"{tool_name}\" was called with identical parameters that already produced output. "
+                            f"Repeating the exact same command will not yield new results. Change parameters or use another tool to continue."
+                        )
+                    else:
+                        payload_text = (
+                            f"Execution Error: Repeated call signature confirmed for tool \"{tool_name}\" with identical parameters. "
+                            f"Your previous call produced identical results. Change parameters or use another tool to proceed."
+                        )
                 
             safe_payload = payload_text.replace("'", "\\'")
             shell_cmd = f"echo '{safe_payload}' && exit 1"
@@ -284,7 +318,7 @@ class AntiLoopEngine:
 
         else:
             # Свежий шаг — обновляем стейт блокировок
-            total_steps = 6 if self.is_fuzzy_mode else 5
+            total_steps = 10 if self.is_fuzzy_mode else 5
             if self.hit_count > 0:
                 logger.info(f"{C_GREEN}🎉 [LOOP BROKEN] Модель успешно сменила стратегию (вызов '{tool_name}'). Счетчик повторов ({self.hit_count}/{total_steps}) сброшен.{C_RESET}")
             self.last_tool = tool_name

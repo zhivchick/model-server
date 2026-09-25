@@ -4,6 +4,24 @@ All notable changes, fixes, and context notes are recorded here to track the evo
 
 ---
 
+## [Anti-Loop Calibration: 5 Free Sliding Shifts & Distinct Sliding Window Error Messages] - 2026-09-25
+
+### 1. `anti_loop.py`
+- **Feature (5 Free Shifts for Sliding Windows / Paging)**: Calibrated sliding window detection so model reading explorations (e.g. `sed 250,280`, `sed 280,310`, `tail -5`, `tail -10`, `tail -15`) receive **5 full free shifts** (`hit_count in (1..5)`) without being prematurely blocked:
+  - `1/10 .. 5/10`: **Grace pass-through**: The command executes normally and completely unmodified, allowing the model to freely locate functions and scan code slices.
+  - `6/10` and `7/10`: Deflection via dedicated sliding window `Execution Error`.
+  - `8/10` and `9/10`: Operator intervention via dedicated sliding window `[USER INTERVENTION]` and `[USER DIRECTIVE - FINAL WARNING]`.
+  - `10/10`: Emergency Dialogue Brake (`compact_trigger_text`).
+- **Feature (Distinct, Honest Error Messages)**: Eliminated false accusations of "same parameters" when parameters are shifting:
+  - **Exact Match Error**: *"The tool '{tool_name}' was called with identical parameters that already produced output. Repeating the exact same command will not yield new results."*
+  - **Sliding Window Error**: *"Sliding window read limit reached for tool '{tool_name}'. You have shifted parameters/line ranges 5+ times in small increments. Do NOT micro-paginate: inspect the required section or file in a single call (e.g. using 'cat' or 'grep -n') or switch your strategy."*
+- **Echo Reflection**: Added `"sliding window"` and `"micro-paginate"` to echo reflection signatures to ensure model cannot echo deflection texts.
+
+### 2. `test_anti_loop.py`
+- **Unit Tests**: Updated `test_sliding_window_escalation_progression` verifying all 5 grace shifts pass through cleanly, step 6/10 displays the sliding window error, step 8/10 triggers user intervention, and step 10/10 triggers the dialogue brake.
+
+---
+
 ## [Unified Anti-Loop Matrix: Exact (1/5..5/5) vs Fuzzy Sliding Window (1/6..6/6)] - 2026-09-25
 
 ### 1. `anti_loop.py`
