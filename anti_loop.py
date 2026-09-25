@@ -16,7 +16,32 @@ class AntiLoopEngine:
     def __init__(self):
         self.last_tool = None
         self.last_skeleton = None
+        self.last_raw_args = None
         self.hit_count = 0
+        self.is_fuzzy_mode = False
+
+    def get_user_intervention_info(self) -> tuple:
+        """
+        Возвращает (step_label, warning_tag, user_intervention_text) если текущее состояние
+        требует внедрения сообщения от имени пользователя в контекст, иначе None.
+        Для exact-повторов: шаги 3/5 и 4/5 (при hit_count 2 и 3).
+        Для fuzzy-повторов: шаги 4/6 и 5/6 (при hit_count 3 и 4).
+        """
+        if not self.last_tool:
+            return None
+        total_steps = 6 if self.is_fuzzy_mode else 5
+        target_hits = (3, 4) if self.is_fuzzy_mode else (2, 3)
+        if self.hit_count in target_hits:
+            is_final = (self.hit_count == target_hits[1])
+            step_current = (5 if is_final else 4) if self.is_fuzzy_mode else (4 if is_final else 3)
+            step_label = f"{step_current}/{total_steps}"
+            warning_tag = "USER DIRECTIVE - FINAL WARNING" if is_final else "USER INTERVENTION"
+            user_intervention_text = (
+                f"[{warning_tag}]: You are stuck calling '{self.last_tool}' repeatedly with identical arguments. "
+                f"As the human operator, I instruct you: do NOT retry this command. Change your approach, inspect different files, or ask me for clarification."
+            )
+            return step_label, warning_tag, user_intervention_text
+        return None
 
     def _protect_github_entity_ids(self, text: str) -> str:
         """
@@ -145,56 +170,88 @@ class AntiLoopEngine:
         else:
             current_skeleton = self._build_argument_skeleton(extracted_args_dict)
 
+        raw_args_str = json.dumps(extracted_args_dict, sort_keys=True, ensure_ascii=False)
         final_json_args = json.dumps(extracted_args_dict, ensure_ascii=False)
 
         # ------------------------------------------------------------
-        # СИММЕТРИЧНАЯ МАТРИЦА ПOВТOРOВ (3 ЭШЕЛОНА ЗАЩИТЫ)
+        # СИММЕТРИЧНАЯ ЕДИНАЯ МАТРИЦА ПOВТOРOВ (Exact: 1/5..5/5, Fuzzy: 1/6..6/6)
         # ------------------------------------------------------------
-        # СИММЕТРИЧНАЯ МАТРИЦА ПOВТOРOВ (3 ЭШЕЛОНА ЗАЩИТЫ: 1/5 .. 5/5)
-        # ------------------------------------------------------------
-        if self.last_tool == tool_name and self.last_skeleton == current_skeleton:
+        is_same_tool = (self.last_tool == tool_name)
+        is_exact_match = is_same_tool and (self.last_raw_args == raw_args_str)
+        is_skeleton_match = is_same_tool and (self.last_skeleton == current_skeleton)
+
+        if is_exact_match or is_skeleton_match:
+            # Если совпал скелет, но аргументы/цифры изменились — включаем нечеткий режим
+            if not is_exact_match and (self.hit_count == 0 or self.is_fuzzy_mode):
+                self.is_fuzzy_mode = True
+            elif is_exact_match and self.hit_count == 0:
+                self.is_fuzzy_mode = False
+
             self.hit_count += 1
-            
-            # 🚨 ЭШЕЛОН 3: КРИТИЧЕСКИЙ СТОП-КРАН (Повтор 5/5, hit_count >= 5) — ОКОНЧАТЕЛЬНЫЙ ОБРЫВ
-            if self.hit_count >= 5:
-                logger.error(f"{C_BOLD}{C_RED}🚨 [CONTEXT EMERGENCY] Повтор 5/5: Лимит повторов исчерпан на туле '{tool_name}'. Аварийный стоп (Dialogue Brake)!{C_RESET}")
+            self.last_raw_args = raw_args_str
+            self.last_skeleton = current_skeleton
+
+            total_steps = 6 if self.is_fuzzy_mode else 5
+
+            # 🌟 НЕЧЕТКИЙ ПОВТОР (SLIDING WINDOW): Шаг 1/6 пропускаем без блокировки (даем дойти до цели)!
+            if self.is_fuzzy_mode and self.hit_count == 1:
+                logger.info(
+                    f"{C_GREEN}ℹ️ [SLIDING WINDOW - 1/6] Тул '{tool_name}' сдвинул параметры/окно. Пропускаем выполнение (попытка 1/6).{C_RESET}"
+                )
+                return tool_name, final_json_args
+
+            # 🚨 ЭШЕЛОН 3: КРИТИЧЕСКИЙ СТОП-КРАН (Dialogue Brake)
+            if self.hit_count >= total_steps:
+                logger.error(
+                    f"{C_BOLD}{C_RED}🚨 [CONTEXT EMERGENCY] Повтор {total_steps}/{total_steps}: Лимит повторов исчерпан на туле '{tool_name}'. Аварийный стоп (Dialogue Brake)!{C_RESET}"
+                )
                 self.hit_count = 0
                 self.last_tool = None
                 self.last_skeleton = None
+                self.last_raw_args = None
+                self.is_fuzzy_mode = False
                 
                 compact_trigger_text = (
-                    f"⚠️ [SERVER NOTICE] Critical repetition loop detected on tool '{tool_name}' (5/5). "
+                    f"⚠️ [SERVER NOTICE] Critical repetition loop detected on tool '{tool_name}' ({total_steps}/{total_steps}). "
                     "Forcing thread synchronization break to return control to the human user and trigger active memory compacting routines."
                 )
                 return None, compact_trigger_text
 
             forced_tool_name = "shell"
 
-            # 👤 ЭШЕЛОН 2: ВТОРЫЕ ДВА ДУБЛЯ (3/5 и 4/5) — ОТВЕТ ОТ ИМЕНИ ЮЗЕРА
-            if self.hit_count == 3:
-                logger.error(f"{C_BOLD}{C_CYAN}👤 [USER INTERVENTION - 3/5] Тул '{tool_name}' повторен 3-й раз. Модель проигнорировала подсказку. Отклоняем payload с [USER INTERVENTION].{C_RESET}")
+            # 👤 ЭШЕЛОН 2: ВМЕШАТЕЛЬСТВО ЮЗЕРА (Exact: 3/5 и 4/5, Fuzzy: 4/6 и 5/6)
+            user_step = 4 if self.is_fuzzy_mode else 3
+            directive_step = 5 if self.is_fuzzy_mode else 4
+
+            if self.hit_count == user_step:
+                logger.error(
+                    f"{C_BOLD}{C_CYAN}👤 [USER INTERVENTION - {user_step}/{total_steps}] Тул '{tool_name}' повторен {user_step}-й раз. Модель проигнорировала подсказку. Отклоняем payload с [USER INTERVENTION].{C_RESET}"
+                )
                 payload_text = (
-                    f"[USER INTERVENTION]: Stop! You have called the tool \"{tool_name}\" 3 times in a row with identical parameters without making progress. "
+                    f"[USER INTERVENTION]: Stop! You have called the tool \"{tool_name}\" {user_step} times in a row with identical parameters without making progress. "
                     f"I am intervening directly as the user: do NOT retry this exact command. "
                     f"Analyze the previous outputs, change your strategy, or ask me for clarification."
                 )
-            elif self.hit_count == 4:
-                logger.error(f"{C_BOLD}{C_RED}👤 [USER DIRECTIVE - 4/5] Тул '{tool_name}' повторен 4-й раз. Финальное предупреждение перед аварийным стопом 5/5. Отклоняем payload.{C_RESET}")
+            elif self.hit_count == directive_step:
+                logger.error(
+                    f"{C_BOLD}{C_RED}👤 [USER DIRECTIVE - {directive_step}/{total_steps}] Тул '{tool_name}' повторен {directive_step}-й раз. Финальное предупреждение перед аварийным стопом {total_steps}/{total_steps}. Отклоняем payload.{C_RESET}"
+                )
                 payload_text = (
                     f"[USER DIRECTIVE - FINAL WARNING]: You are ignoring instructions and still attempting to call \"{tool_name}\". "
                     f"This is your final warning: do NOT invoke \"{tool_name}\" again with these arguments. "
                     f"Summarize what is blocking you or switch to an entirely different approach now, or the session will be terminated."
                 )
-            # 🛠️ ЭШЕЛОН 1: ПЕРВЫЕ ДВА ДУБЛЯ (1/5 и 2/5) — ПОДМЕНА ОТВЕТА ТУЛА
+            # 🛠️ ЭШЕЛОН 1: ПОДМЕНА ОТВЕТА ТУЛА (Exact: 1/5 и 2/5, Fuzzy: 2/6 и 3/6)
             elif is_idle_edit:
-                logger.warning(f"{C_YELLOW}⚠️ [ANTI-LOOP FIREWALL] Повтор {self.hit_count}/5: Идентичные before/after у '{tool_name}'. Отклоняем payload с ошибкой.{C_RESET}")
+                logger.warning(f"{C_YELLOW}⚠️ [ANTI-LOOP FIREWALL] Повтор {self.hit_count}/{total_steps}: Идентичные before/after у '{tool_name}'. Отклоняем payload с ошибкой.{C_RESET}")
                 payload_text = (
                     "Execution Error: The \"before\" and \"after\" parameters are byte-for-byte identical. "
                     "Your edit action did NOT change any code. Rewrite your \"after\" block to apply real modifications or use another tool."
                 )
             elif is_edit_tool:
-                logger.warning(f"{C_YELLOW}⚠️ [ANTI-LOOP FIREWALL] Повтор {self.hit_count}/5: Зацикливание правки '{tool_name}'. Внедряем подсказку расширить контекст.{C_RESET}")
-                if self.hit_count == 1:
+                logger.warning(f"{C_YELLOW}⚠️ [ANTI-LOOP FIREWALL] Повтор {self.hit_count}/{total_steps}: Зацикливание правки '{tool_name}'. Внедряем подсказку расширить контекст.{C_RESET}")
+                first_echo_hit = 2 if self.is_fuzzy_mode else 1
+                if self.hit_count == first_echo_hit:
                     payload_text = (
                         "Execution Error: The block you provided in the \"before\" parameter matches multiple lines in the file. "
                         "Do NOT repeat the exact same \"before\" string. To fix this, look at the Match lines and rewrite your edit call "
@@ -206,10 +263,11 @@ class AntiLoopEngine:
                         "(at least 3-5 unique lines above and below) or inspect the file with a read tool first."
                     )
             else:
-                # Стандартный блок для shell / ls / cat на 1/5 и 2/5
-                escalation_hint = " (Внимание: следующий повтор 3/5 подключит оператора [USER INTERVENTION])" if self.hit_count == 2 else ""
-                logger.warning(f"{C_YELLOW}⚠️ [ANTI-LOOP FIREWALL] Повтор {self.hit_count}/5: Тул '{tool_name}' вызван повторно. Подменяем ответ тула на Execution Error.{escalation_hint}{C_RESET}")
-                if self.hit_count == 1:
+                first_echo_hit = 2 if self.is_fuzzy_mode else 1
+                second_echo_hit = 3 if self.is_fuzzy_mode else 2
+                escalation_hint = f" (Внимание: следующий повтор {user_step}/{total_steps} подключит оператора [USER INTERVENTION])" if self.hit_count == second_echo_hit else ""
+                logger.warning(f"{C_YELLOW}⚠️ [ANTI-LOOP FIREWALL] Повтор {self.hit_count}/{total_steps}: Тул '{tool_name}' вызван повторно. Подменяем ответ тула на Execution Error.{escalation_hint}{C_RESET}")
+                if self.hit_count == first_echo_hit:
                     payload_text = (
                         f"Execution Error: The tool \"{tool_name}\" called multiple times with the same parameters. "
                         f"Change parameters or use another tool to continue."
@@ -226,11 +284,14 @@ class AntiLoopEngine:
 
         else:
             # Свежий шаг — обновляем стейт блокировок
+            total_steps = 6 if self.is_fuzzy_mode else 5
             if self.hit_count > 0:
-                logger.info(f"{C_GREEN}🎉 [LOOP BROKEN] Модель успешно сменила стратегию (вызов '{tool_name}'). Счетчик повторов ({self.hit_count}/5) сброшен.{C_RESET}")
+                logger.info(f"{C_GREEN}🎉 [LOOP BROKEN] Модель успешно сменила стратегию (вызов '{tool_name}'). Счетчик повторов ({self.hit_count}/{total_steps}) сброшен.{C_RESET}")
             self.last_tool = tool_name
             self.last_skeleton = current_skeleton
+            self.last_raw_args = raw_args_str
             self.hit_count = 0
+            self.is_fuzzy_mode = False
 
         # Если это холостой вызов на самом первом витке (hit_count == 0)
         if is_idle_edit:

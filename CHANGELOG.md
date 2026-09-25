@@ -4,6 +4,29 @@ All notable changes, fixes, and context notes are recorded here to track the evo
 
 ---
 
+## [Unified Anti-Loop Matrix: Exact (1/5..5/5) vs Fuzzy Sliding Window (1/6..6/6)] - 2026-09-25
+
+### 1. `anti_loop.py`
+- **Feature (Unified Repetition Escalation)**: Unified the repetition detection logic for exact 1-to-1 matching and sliding window (parameter shifting / digit variation) without creating separate prompt text branches.
+  - **Exact Match (1/5 .. 5/5)**: When arguments match byte-for-byte (`last_raw_args == current_raw_args`):
+    - `1/5` and `2/5`: Tool deflection via `Execution Error`.
+    - `3/5` and `4/5`: Operator intervention via `[USER INTERVENTION]` and `[USER DIRECTIVE - FINAL WARNING]`.
+    - `5/5`: Emergency Dialogue Brake (`compact_trigger_text`).
+  - **Fuzzy / Sliding Window Match (1/6 .. 6/6)**: When the argument skeleton matches after stripping digits, but raw arguments/numbers have changed (e.g. `sed 10,20p` -> `sed 20,30p`):
+    - `1/6`: **Grace pass-through**: The command is executed normally without penalty, allowing the model a legitimate attempt to page forward and reach the end of the block/file.
+    - `2/6` and `3/6`: Tool deflection via `Execution Error`.
+    - `4/6` and `5/6`: Operator intervention via `[USER INTERVENTION]` and `[USER DIRECTIVE - FINAL WARNING]`.
+    - `6/6`: Emergency Dialogue Brake (`compact_trigger_text`).
+- **Helper (`get_user_intervention_info`)**: Centralized determination of user intervention steps (`(2, 3)` for exact, `(3, 4)` for fuzzy) so prompt hook callers remain completely decoupled.
+
+### 2. `goose_hooks.py`
+- **Integration**: Updated prompt injection hook to invoke `anti_loop_engine.get_user_intervention_info()`, properly injecting user role messages before steps 3/5, 4/5 (exact) and 4/6, 5/6 (fuzzy).
+
+### 3. `test_anti_loop.py`
+- **Unit Tests**: Added `test_sliding_window_escalation_progression` validating the full 1/6 .. 6/6 escalation lifecycle, ensuring step 1/6 passes through unmodified and step 6/6 trips the hard dialogue brake.
+
+---
+
 ## [Echo Reflection Trap & End-to-End 1/5..5/5 Escalation] - 2026-09-24
 
 ### 1. `anti_loop.py`

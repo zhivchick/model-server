@@ -60,15 +60,11 @@ def apply_pre_call_hooks(body: dict) -> tuple:
                 clean_msg["tool_calls"] = hf_calls
         fixed_messages.append(clean_msg)
 
-    # 🎯 Prompt-level User Intervention перед генерацией шагов 3/5 и 4/5 (при hit_count == 2 и 3)
+    # 🎯 Prompt-level User Intervention перед генерацией шагов оператора (Exact: 3/5 и 4/5, Fuzzy: 4/6 и 5/6)
     from anti_loop import anti_loop_engine, C_BOLD, C_CYAN, C_YELLOW, C_RESET
-    if anti_loop_engine.hit_count in (2, 3) and anti_loop_engine.last_tool:
-        step_label = "4/5" if anti_loop_engine.hit_count == 3 else "3/5"
-        warning_tag = "USER DIRECTIVE - FINAL WARNING" if anti_loop_engine.hit_count == 3 else "USER INTERVENTION"
-        user_intervention_text = (
-            f"[{warning_tag}]: You are stuck calling '{anti_loop_engine.last_tool}' repeatedly with identical arguments. "
-            f"As the human operator, I instruct you: do NOT retry this command. Change your approach, inspect different files, or ask me for clarification."
-        )
+    intervention = anti_loop_engine.get_user_intervention_info()
+    if intervention:
+        step_label, warning_tag, user_intervention_text = intervention
         # Добавляем роль 'user' в конец контекста (вызывает сдвиг last_query_index в Jinja)
         fixed_messages.append({"role": "user", "content": user_intervention_text})
         logger.warning(
