@@ -60,21 +60,22 @@ def apply_pre_call_hooks(body: dict) -> tuple:
                 clean_msg["tool_calls"] = hf_calls
         fixed_messages.append(clean_msg)
 
-    # 🎯 Prompt-level User Intervention before calls 4 and 5 (when loop depth is 2 or 3)
-    # CRITICAL: We inject into the trailing tool message content instead of appending a new
-    # 'user' role message. Appending a 'user' role shifts Jinja's `last_query_index`, causing
-    # the template to prune `<think>` blocks from all prior assistant turns and collapsing the KV-cache.
-    from anti_loop import anti_loop_engine
-    if anti_loop_engine.hit_count in (2, 3) and anti_loop_engine.last_tool and fixed_messages:
+    # 🎯 Prompt-level User Intervention перед генерацией шагов 3/5 и 4/5 (при hit_count == 2 и 3)
+    from anti_loop import anti_loop_engine, C_BOLD, C_CYAN, C_YELLOW, C_RESET
+    if anti_loop_engine.hit_count in (2, 3) and anti_loop_engine.last_tool:
+        step_label = "4/5" if anti_loop_engine.hit_count == 3 else "3/5"
         warning_tag = "USER DIRECTIVE - FINAL WARNING" if anti_loop_engine.hit_count == 3 else "USER INTERVENTION"
         user_intervention_text = (
-            f"\n\n[{warning_tag}]: You are stuck calling '{anti_loop_engine.last_tool}' repeatedly with identical arguments. "
+            f"[{warning_tag}]: You are stuck calling '{anti_loop_engine.last_tool}' repeatedly with identical arguments. "
             f"As the human operator, I instruct you: do NOT retry this command. Change your approach, inspect different files, or ask me for clarification."
         )
-        if fixed_messages[-1].get("role") == "tool":
-            fixed_messages[-1]["content"] = (fixed_messages[-1].get("content") or "") + user_intervention_text
-        else:
-            fixed_messages.append({"role": "user", "content": user_intervention_text.strip()})
+        # Добавляем роль 'user' в конец контекста (вызывает сдвиг last_query_index в Jinja)
+        fixed_messages.append({"role": "user", "content": user_intervention_text})
+        logger.warning(
+            f"{C_BOLD}{C_CYAN}👤 [USER INTERVENTION INJECTED - {step_label}]{C_RESET} {C_YELLOW}Повтор {step_label}: "
+            f"Внедряем прямое указание оператора [{warning_tag}] в контекст модели. "
+            f"(Примечание: роль user сдвигает last_query_index в Jinja, вызывая штатный сброс кэша из-за очистки устаревших <think> блоков).{C_RESET}"
+        )
 
     # 🎯 Enforce reasoning suppression across all template layout arguments
     template_kwargs = {
@@ -82,13 +83,9 @@ def apply_pre_call_hooks(body: dict) -> tuple:
         "add_generation_prompt": True,
         "thinking": False,
         "enable_thinking": False,
-        "preserve_thinking": True,
-        "preserve_reasoning": True,
         "chat_template_args": {
             "enable_thinking": False,
-            "thinking": False,
-            "preserve_thinking": True,
-            "preserve_reasoning": True
+            "thinking": False
         }
     }
     

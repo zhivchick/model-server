@@ -4,6 +4,23 @@ All notable changes, fixes, and context notes are recorded here to track the evo
 
 ---
 
+## [Echo Reflection Trap & End-to-End 1/5..5/5 Escalation] - 2026-09-24
+
+### 1. `anti_loop.py`
+- **Feature (Echo Reflection Trap)**: Added `_detect_echo_reflection` to catch cases where the model autoregressively hallucinated the firewall's own previous deflection command (`echo 'Execution Error: The tool "shell" called multiple times...' && exit 1`).
+  - When the command uses `echo` combined with firewall signature phrases (`execution error`, `called multiple times`, `repeated call signature`, `user intervention`, `pivot your command`, etc.), the call is immediately intercepted without executing through Goose (`t_name is None`).
+  - Goose receives a direct user intervention text chunk (`[USER INTERVENTION]: You are echoing the server's previous execution error back as a shell command! Immediately STOP calling 'echo' with error messages...`), returning control without spawning any subprocess in bash.
+- **Enhancement (End-to-End 1/5 .. 5/5 Counters)**:
+  - Repetition counter unified across logs to `1/5` (repeat 1, tool error), `2/5` (repeat 2, tool error + warning of user intervention), `3/5` (repeat 3, user intervention), `4/5` (repeat 4, user directive final warning), and `5/5` (emergency Dialogue Brake).
+
+### 2. `goose_hooks.py`
+- **Enhancement**: Restored `role: "user"` prompt injection at steps `3/5` and `4/5` (`hit_count in (2, 3)`), as direct user messages reliably break stubborn model loops. Added transparent, colored console logging explaining why the subsequent KV-cache shift occurs.
+
+### 3. `test_anti_loop.py`
+- **Unit Tests**: Added test coverage verifying the echo reflection trap suppresses tool calls completely (`t_name is None`), while allowing legitimate echo commands (`echo 'Hello world'`) and non-echo grep commands searching for errors.
+
+---
+
 ## [Anti-Loop Escalation & GitHub ID Exemption] - 2026-09-24
 
 ### 1. `anti_loop.py`

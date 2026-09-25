@@ -59,6 +59,45 @@ class AntiLoopEngine:
         protected_str = self._protect_github_entity_ids(raw_str)
         return re.sub(r'\d+', '', protected_str)
 
+    def _detect_echo_reflection(self, tool_name: str, extracted_args_dict: dict, full_text: str) -> bool:
+        """
+        Проверяет, не пытается ли модель выполнить команду echo, содержащую сигнатуры
+        системных сообщений об ошибках нашего собственного файрвола.
+        """
+        cmd_candidates = []
+        if isinstance(extracted_args_dict, dict):
+            for k in ("command", "cmd", "raw_arguments"):
+                v = extracted_args_dict.get(k)
+                if isinstance(v, str):
+                    cmd_candidates.append(v)
+        
+        if not cmd_candidates and full_text:
+            cmd_candidates.append(full_text)
+
+        firewall_signatures = [
+            "execution error",
+            "called multiple times",
+            "repeated call signature",
+            "user intervention",
+            "user directive",
+            "continuous loop lock",
+            "deflecting payload",
+            "pivot your command",
+            "change parameters or use another tool",
+            "byte-for-byte identical",
+            "matches multiple lines",
+            "ambiguity loop",
+        ]
+
+        for text in cmd_candidates:
+            if re.search(r'\becho\b', text, re.IGNORECASE):
+                lower_text = text.lower()
+                for sig in firewall_signatures:
+                    if sig in lower_text:
+                        return True
+
+        return False
+
     def evaluate_and_process(self, full_text: str, parser_tool_name: str, extracted_args_dict: dict) -> tuple:
         # Определяем реальное имя тула
         func_match = re.search(r'<?function=([^>]+)>?', full_text)
@@ -66,6 +105,26 @@ class AntiLoopEngine:
             tool_name = func_match.group(1).strip().replace('"', '').replace("'", "")
         else:
             tool_name = parser_tool_name if parser_tool_name else "shell"
+
+        # ------------------------------------------------------------
+        # 🛑 ДЕТЕКТОР ЭХО-ГАЛЛЮЦИНАЦИЙ ОШИБОК ФАЙРВОЛА (ECHO REFLECTION TRAP)
+        # Если модель пытается вызвать 'echo' с текстом системной ошибки сервера,
+        # блокируем вызов в Goose и мгновенно возвращаем текст от имени юзера.
+        # ------------------------------------------------------------
+        if self._detect_echo_reflection(tool_name, extracted_args_dict, full_text):
+            logger.error(
+                f"{C_BOLD}{C_RED}🛑 [ECHO REFLECTION TRAP] Модель пытается выполнить 'echo' с текстом ошибки файрвола! "
+                f"Блокируем тул-колл в Goose, возвращаем прямое вмешательство пользователя.{C_RESET}"
+            )
+            self.hit_count = 0
+            self.last_tool = None
+            self.last_skeleton = None
+            reflection_text = (
+                "[USER INTERVENTION]: You are echoing the server's previous execution error back as a shell command! "
+                "Immediately STOP calling 'echo' with error messages. "
+                "Analyze what actually needs to be done, change your strategy, and use legitimate tools."
+            )
+            return None, reflection_text
 
         # Проверяем, является ли инструмент правкой кода
         is_edit_tool = tool_name in ["edit", "developer__edit", "patch"]
@@ -91,49 +150,50 @@ class AntiLoopEngine:
         # ------------------------------------------------------------
         # СИММЕТРИЧНАЯ МАТРИЦА ПOВТOРOВ (3 ЭШЕЛОНА ЗАЩИТЫ)
         # ------------------------------------------------------------
+        # СИММЕТРИЧНАЯ МАТРИЦА ПOВТOРOВ (3 ЭШЕЛОНА ЗАЩИТЫ: 1/5 .. 5/5)
+        # ------------------------------------------------------------
         if self.last_tool == tool_name and self.last_skeleton == current_skeleton:
             self.hit_count += 1
-            logger.warning(f"{C_YELLOW}⚠️ [ANTI-LOOP FIREWALL] Repetitive pattern found! Tool: '{tool_name}', Depth: {self.hit_count}{C_RESET}")
             
-            # 🚨 ЭШЕЛОН 3: КРИТИЧЕСКИЙ СТОП-КРАН (Попытка 6, hit_count >= 5) — ОКОНЧАТЕЛЬНЫЙ ОБРЫВ
+            # 🚨 ЭШЕЛОН 3: КРИТИЧЕСКИЙ СТОП-КРАН (Повтор 5/5, hit_count >= 5) — ОКОНЧАТЕЛЬНЫЙ ОБРЫВ
             if self.hit_count >= 5:
-                logger.error(f"{C_BOLD}{C_RED}🚨 [CONTEXT EMERGENCY] Hard threshold reached on tool '{tool_name}' (Depth {self.hit_count}). Forcing Dialogue Brake!{C_RESET}")
+                logger.error(f"{C_BOLD}{C_RED}🚨 [CONTEXT EMERGENCY] Повтор 5/5: Лимит повторов исчерпан на туле '{tool_name}'. Аварийный стоп (Dialogue Brake)!{C_RESET}")
                 self.hit_count = 0
                 self.last_tool = None
                 self.last_skeleton = None
                 
                 compact_trigger_text = (
-                    f"⚠️ [SERVER NOTICE] Critical repetition loop detected on tool '{tool_name}'. "
+                    f"⚠️ [SERVER NOTICE] Critical repetition loop detected on tool '{tool_name}' (5/5). "
                     "Forcing thread synchronization break to return control to the human user and trigger active memory compacting routines."
                 )
                 return None, compact_trigger_text
 
             forced_tool_name = "shell"
 
-            # 👤 ЭШЕЛОН 2: ВТОРЫЕ ДВА ДУБЛЯ (Вызовы 4 и 5, hit_count == 3 и 4) — ОТВЕТ ОТ ИМЕНИ ЮЗЕРА
+            # 👤 ЭШЕЛОН 2: ВТОРЫЕ ДВА ДУБЛЯ (3/5 и 4/5) — ОТВЕТ ОТ ИМЕНИ ЮЗЕРА
             if self.hit_count == 3:
-                logger.error(f"{C_BOLD}{C_CYAN}👤 [USER INTERVENTION - CALL 4] Tool '{tool_name}' repeated 3 times. Injecting human operator intervention.{C_RESET}")
+                logger.error(f"{C_BOLD}{C_CYAN}👤 [USER INTERVENTION - 3/5] Тул '{tool_name}' повторен 3-й раз. Модель проигнорировала подсказку. Отклоняем payload с [USER INTERVENTION].{C_RESET}")
                 payload_text = (
                     f"[USER INTERVENTION]: Stop! You have called the tool \"{tool_name}\" 3 times in a row with identical parameters without making progress. "
                     f"I am intervening directly as the user: do NOT retry this exact command. "
                     f"Analyze the previous outputs, change your strategy, or ask me for clarification."
                 )
             elif self.hit_count == 4:
-                logger.error(f"{C_BOLD}{C_RED}👤 [USER DIRECTIVE - CALL 5] Final warning before session break on tool '{tool_name}'. Injecting strict user directive.{C_RESET}")
+                logger.error(f"{C_BOLD}{C_RED}👤 [USER DIRECTIVE - 4/5] Тул '{tool_name}' повторен 4-й раз. Финальное предупреждение перед аварийным стопом 5/5. Отклоняем payload.{C_RESET}")
                 payload_text = (
                     f"[USER DIRECTIVE - FINAL WARNING]: You are ignoring instructions and still attempting to call \"{tool_name}\". "
                     f"This is your final warning: do NOT invoke \"{tool_name}\" again with these arguments. "
                     f"Summarize what is blocking you or switch to an entirely different approach now, or the session will be terminated."
                 )
-            # 🛠️ ЭШЕЛОН 1: ПЕРВЫЕ ДВА ДУБЛЯ (Вызовы 2 и 3, hit_count == 1 и 2) — ПОДМЕНА ОТВЕТА ТУЛА
+            # 🛠️ ЭШЕЛОН 1: ПЕРВЫЕ ДВА ДУБЛЯ (1/5 и 2/5) — ПОДМЕНА ОТВЕТА ТУЛА
             elif is_idle_edit:
-                logger.error(f"{C_YELLOW}🚨 [ANTI-LOOP FIREWALL] Идентичные before/after на витке {self.hit_count}. Отклоняем payload.{C_RESET}")
+                logger.warning(f"{C_YELLOW}⚠️ [ANTI-LOOP FIREWALL] Повтор {self.hit_count}/5: Идентичные before/after у '{tool_name}'. Отклоняем payload с ошибкой.{C_RESET}")
                 payload_text = (
                     "Execution Error: The \"before\" and \"after\" parameters are byte-for-byte identical. "
                     "Your edit action did NOT change any code. Rewrite your \"after\" block to apply real modifications or use another tool."
                 )
             elif is_edit_tool:
-                logger.error(f"{C_GREEN}💡 [SMART ASSIST] Continuous ambiguous edit detected! Injecting guide.{C_RESET}")
+                logger.warning(f"{C_YELLOW}⚠️ [ANTI-LOOP FIREWALL] Повтор {self.hit_count}/5: Зацикливание правки '{tool_name}'. Внедряем подсказку расширить контекст.{C_RESET}")
                 if self.hit_count == 1:
                     payload_text = (
                         "Execution Error: The block you provided in the \"before\" parameter matches multiple lines in the file. "
@@ -146,8 +206,9 @@ class AntiLoopEngine:
                         "(at least 3-5 unique lines above and below) or inspect the file with a read tool first."
                     )
             else:
-                # Стандартный жесткий блок для shell / ls / cat на Depth 1 и 2
-                logger.error(f"{C_YELLOW}🚨 [FIREWALL BRICKWALL] Continuous loop lock sustained on tool '{tool_name}'. Deflecting payload.{C_RESET}")
+                # Стандартный блок для shell / ls / cat на 1/5 и 2/5
+                escalation_hint = " (Внимание: следующий повтор 3/5 подключит оператора [USER INTERVENTION])" if self.hit_count == 2 else ""
+                logger.warning(f"{C_YELLOW}⚠️ [ANTI-LOOP FIREWALL] Повтор {self.hit_count}/5: Тул '{tool_name}' вызван повторно. Подменяем ответ тула на Execution Error.{escalation_hint}{C_RESET}")
                 if self.hit_count == 1:
                     payload_text = (
                         f"Execution Error: The tool \"{tool_name}\" called multiple times with the same parameters. "
@@ -166,7 +227,7 @@ class AntiLoopEngine:
         else:
             # Свежий шаг — обновляем стейт блокировок
             if self.hit_count > 0:
-                logger.info("🎉 [LOOP BROKEN] Model successfully pivoted to a different execution strategy. Flushing firewall blocks.")
+                logger.info(f"{C_GREEN}🎉 [LOOP BROKEN] Модель успешно сменила стратегию (вызов '{tool_name}'). Счетчик повторов ({self.hit_count}/5) сброшен.{C_RESET}")
             self.last_tool = tool_name
             self.last_skeleton = current_skeleton
             self.hit_count = 0

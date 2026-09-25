@@ -119,10 +119,29 @@ class TestAntiLoopSuite(unittest.TestCase):
         }
 
         fixed_messages, kwargs = apply_pre_call_hooks(body)
-        self.assertEqual(fixed_messages[-1]["role"], "tool")
+        self.assertEqual(fixed_messages[-1]["role"], "user")
         self.assertIn("[USER INTERVENTION]", fixed_messages[-1]["content"])
         self.assertIn("developer__edit", fixed_messages[-1]["content"])
-        self.assertTrue(kwargs.get("preserve_thinking"))
+
+    def test_echo_reflection_trap(self):
+        engine = AntiLoopEngine()
+        echo_cmd = (
+            "echo 'Execution Error: The tool \"shell\" called multiple times with the same parameters. "
+            "Change parameters or use another tool to continue.' && exit 1"
+        )
+        t_name, t_content = engine.evaluate_and_process("", "shell", {"command": echo_cmd})
+        self.assertIsNone(t_name, "Tool call must be suppressed completely (t_name is None)")
+        self.assertIn("[USER INTERVENTION]", t_content)
+        self.assertIn("echoing the server's previous execution error", t_content)
+
+        # Ensure normal echo is NOT blocked
+        t_normal, args_normal = engine.evaluate_and_process("", "shell", {"command": "echo 'Hello world'"})
+        self.assertEqual(t_normal, "shell")
+        self.assertIn("Hello world", args_normal)
+
+        # Ensure grep for execution error in code is NOT blocked (no echo command)
+        t_grep, args_grep = engine.evaluate_and_process("", "shell", {"command": "grep 'Execution Error' log.txt"})
+        self.assertEqual(t_grep, "shell")
 
 if __name__ == "__main__":
     unittest.main()
