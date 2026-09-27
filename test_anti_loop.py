@@ -52,8 +52,8 @@ class TestAntiLoopSuite(unittest.TestCase):
         skel_list2 = engine._build_argument_skeleton({"command": "gh issue list -L 20"})
         self.assertEqual(skel_list1, skel_list2, "Pagination limit changes must be caught as loops!")
 
-    def test_three_tier_anti_loop_progression(self):
-        engine = AntiLoopEngine()
+    def test_three_tier_anti_loop_progression_zero_free(self):
+        engine = AntiLoopEngine(free_hits=0)
         tool = "shell"
         args = {"command": "cat /tmp/nonexistent.log"}
 
@@ -92,6 +92,77 @@ class TestAntiLoopSuite(unittest.TestCase):
         self.assertIn("Critical repetition loop detected", a6)
         self.assertEqual(engine.hit_count, 0, "Hit count must reset after dialogue brake!")
 
+    def test_exact_repeat_five_free_hits(self):
+        engine = AntiLoopEngine(free_hits=5)
+        tool = "shell"
+        args = {"command": "cat /tmp/nonexistent.log"}
+
+        # Call 1: normal execution
+        t1, _ = engine.evaluate_and_process("", tool, args)
+        self.assertEqual(t1, "shell")
+        self.assertEqual(engine.hit_count, 0)
+
+        # Calls 2..6: 5 free repetitions (grace hits 1..5) -> ALL MUST PASS!
+        for i in range(1, 6):
+            t, a = engine.evaluate_and_process("", tool, args)
+            self.assertEqual(t, "shell")
+            self.assertEqual(engine.hit_count, i)
+            self.assertFalse(engine.is_fuzzy_mode)
+            self.assertEqual(json.loads(a), args, f"Exact repeat {i}/5 must pass through unmodified!")
+
+        # Call 7: hit 6/10 -> Tier 1 (Tool error deflection)
+        t7, a7 = engine.evaluate_and_process("", tool, args)
+        self.assertEqual(t7, "shell")
+        self.assertEqual(engine.hit_count, 6)
+        self.assertIn("Execution Error", a7)
+        self.assertIn("called with identical parameters 6 times", a7)
+
+        # Call 8: hit 7/10 -> Tier 1 (Tool error deflection 2)
+        t8, a8 = engine.evaluate_and_process("", tool, args)
+        self.assertEqual(t8, "shell")
+        self.assertEqual(engine.hit_count, 7)
+        self.assertIn("Execution Error", a8)
+
+        # Call 9: hit 8/10 -> Tier 2 (User Intervention level 1)
+        t9, a9 = engine.evaluate_and_process("", tool, args)
+        self.assertEqual(t9, "shell")
+        self.assertEqual(engine.hit_count, 8)
+        self.assertIn("[USER INTERVENTION]", a9)
+
+        # Call 10: hit 9/10 -> Tier 2 (User Directive final warning)
+        t10, a10 = engine.evaluate_and_process("", tool, args)
+        self.assertEqual(t10, "shell")
+        self.assertEqual(engine.hit_count, 9)
+        self.assertIn("[USER DIRECTIVE - FINAL WARNING]", a10)
+
+        # Call 11: hit 10/10 -> Tier 3 (Hard Dialogue Brake)
+        t11, a11 = engine.evaluate_and_process("", tool, args)
+        self.assertIsNone(t11)
+        self.assertIn("Critical repetition loop detected", a11)
+        self.assertEqual(engine.hit_count, 0)
+
+    def test_dynamic_reconfiguration(self):
+        engine = AntiLoopEngine(free_hits=1)
+        engine.configure(2)
+        self.assertEqual(engine.free_hits, 2)
+        tool = "shell"
+        args = {"command": "git status"}
+
+        # Fresh call
+        engine.evaluate_and_process("", tool, args)
+        self.assertEqual(engine.hit_count, 0)
+
+        # Free hits 1 and 2 pass
+        engine.evaluate_and_process("", tool, args)
+        self.assertEqual(engine.hit_count, 1)
+        engine.evaluate_and_process("", tool, args)
+        self.assertEqual(engine.hit_count, 2)
+
+        # Hit 3 deflects with error (2 + 1)
+        _, a3 = engine.evaluate_and_process("", tool, args)
+        self.assertEqual(engine.hit_count, 3)
+        self.assertIn("Execution Error", a3)
+
     def test_pivot_resets_counter(self):
         engine = AntiLoopEngine()
         tool = "shell"
@@ -107,6 +178,8 @@ class TestAntiLoopSuite(unittest.TestCase):
         self.assertEqual(engine.hit_count, 0, "Pivoting to a new command must reset hit_count!")
 
     def test_goose_hooks_user_injection(self):
+        # Test with configure(0): target hits are (2, 3)
+        anti_loop_engine.configure(0)
         anti_loop_engine.hit_count = 2
         anti_loop_engine.last_tool = "developer__edit"
 
@@ -122,6 +195,13 @@ class TestAntiLoopSuite(unittest.TestCase):
         self.assertEqual(fixed_messages[-1]["role"], "user")
         self.assertIn("[USER INTERVENTION]", fixed_messages[-1]["content"])
         self.assertIn("developer__edit", fixed_messages[-1]["content"])
+
+        # Test with configure(5): target hits are (7, 8)
+        anti_loop_engine.configure(5)
+        anti_loop_engine.hit_count = 7
+        fixed_messages_5, _ = apply_pre_call_hooks(body)
+        self.assertEqual(fixed_messages_5[-1]["role"], "user")
+        self.assertIn("[USER INTERVENTION]", fixed_messages_5[-1]["content"])
 
     def test_sliding_window_escalation_progression(self):
         engine = AntiLoopEngine()

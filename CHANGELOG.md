@@ -4,6 +4,34 @@ All notable changes, fixes, and context notes are recorded here to track the evo
 
 ---
 
+## [Configurable Free Repetitions Limit for Exact Repeats & Sliding Windows] - 2026-09-27
+
+### 1. `tq_server.py`
+- **Feature (CLI Argument & Config)**: Added CLI parameters `--anti-loop-free-limit` (alias: `--free-loop-limit`) with default `5` (also configurable via `ANTI_LOOP_FREE_HITS` environment variable).
+- Configures `anti_loop_engine.configure(args.anti_loop_free_limit)` during server initialization.
+
+### 2. `anti_loop.py`
+- **Feature (Universal Grace Repetitions)**: Unified tolerance across **both** exact parameter duplicates and sliding window pagination:
+  - Both exact calls (`sed -n 1,10p` -> `sed -n 1,10p`) and sliding shifts (`tail -5` -> `tail -10` -> `tail -15`) now allow `N` free repetitions (default 5).
+  - Scale dynamically scales: `total_steps = free_hits + 5`.
+  - Attempts `1..N`: Grace pass-through (`hit_count <= free_hits`) execution proceeds normally without blocking.
+  - Attempt `N + 1`: Tool error deflection 1.
+  - Attempt `N + 2`: Tool error deflection 2 (informs that next repeat connects operator).
+  - Attempt `N + 3`: Prompt-level Operator Intervention `[USER INTERVENTION]`.
+  - Attempt `N + 4`: Prompt-level Final Warning `[USER DIRECTIVE - FINAL WARNING]`.
+  - Attempt `N + 5`: Emergency Dialogue Brake (`total_steps / total_steps`).
+- **Dynamic Reconfiguration**: Added `configure(free_hits: int)` method to dynamically adjust limit.
+
+### 3. `test_anti_loop.py`
+- **Unit Tests**:
+  - `test_exact_repeat_five_free_hits`: Verified 5 exact repeats pass through cleanly, step 6 triggers tool error, step 8 triggers user intervention, step 10 triggers dialogue brake.
+  - `test_three_tier_anti_loop_progression_zero_free`: Verified zero-free mode (`free_hits=0`) escalates immediately at hit 1.
+  - `test_dynamic_reconfiguration`: Verified dynamic reconfiguration (`configure(2)`).
+  - `test_goose_hooks_user_injection`: Verified user injection timing under configured limits.
+  - All 10 unit tests passing cleanly.
+
+---
+
 ## [Anti-Loop Calibration: 5 Free Sliding Shifts & Distinct Sliding Window Error Messages] - 2026-09-25
 
 ### 1. `anti_loop.py`

@@ -23,11 +23,16 @@ parser.add_argument("--port", type=int, default=8080)
 parser.add_argument("--max-tokens", type=int, default=4096)
 parser.add_argument("--prefill-step-size", type=int, default=512)
 parser.add_argument("--log-level", type=str, default="info", choices=["info", "debug", "warning", "error"])
+parser.add_argument("--anti-loop-free-limit", "--free-loop-limit", type=int, default=int(os.environ.get("ANTI_LOOP_FREE_HITS", "5")), help="Number of free repetitions allowed before anti-loop escalation (default: 5)")
 args, unknown = parser.parse_known_args()
 
 numeric_level = getattr(logging, args.log_level.upper(), logging.INFO)
 logging.basicConfig(level=numeric_level, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger("mlx_lm_server")
+
+# Настройка лимитов анти-лупа
+from anti_loop import anti_loop_engine
+anti_loop_engine.configure(args.anti_loop_free_limit)
 
 C_GREEN, C_YELLOW, C_RESET = "\033[92m", "\033[93m", "\033[0m"
 
