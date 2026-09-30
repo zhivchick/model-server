@@ -60,7 +60,7 @@ def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id,
         
         with mx.StreamContext(mx.default_stream(mx.gpu)):
             logger.debug("Initializing mlx_lm.generate.stream_generate loop instance...")
-            # Передаем repetition_penalty если поддерживается версией mlx_lm
+            # Собираем правильный logits_processors для mlx_lm
             gen_kwargs = {
                 "prompt": prompt_ids,
                 "max_tokens": max_tokens,
@@ -68,16 +68,15 @@ def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id,
                 "prefill_step_size": prefill_step_size
             }
             if repetition_penalty and repetition_penalty > 1.0:
-                gen_kwargs["repetition_penalty"] = repetition_penalty
+                try:
+                    from mlx_lm.sample_utils import make_logits_processors
+                    processors = make_logits_processors(repetition_penalty=repetition_penalty, repetition_context_size=64)
+                    if processors:
+                        gen_kwargs["logits_processors"] = processors
+                except Exception:
+                    pass
 
-            try:
-                generator_instance = stream_generate(model, tokenizer, **gen_kwargs)
-            except TypeError:
-                # Фоллбэк если сигнатура stream_generate в старой версии не принимает repetition_penalty напрямую
-                generator_instance = stream_generate(
-                    model, tokenizer, prompt=prompt_ids, max_tokens=max_tokens, 
-                    prompt_cache=global_cache, prefill_step_size=prefill_step_size
-                )
+            generator_instance = stream_generate(model, tokenizer, **gen_kwargs)
 
             try:
                 first_response = next(generator_instance)
