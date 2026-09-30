@@ -277,5 +277,20 @@ class TestAntiLoopSuite(unittest.TestCase):
         t_grep, args_grep = engine.evaluate_and_process("", "shell", {"command": "grep 'Execution Error' log.txt"})
         self.assertEqual(t_grep, "shell")
 
+    def test_deflection_command_bash_syntax_validity(self):
+        engine = AntiLoopEngine(free_hits=0)
+        tool = "shell"
+        args = {"command": "sed -n '1,10p' file.go"}
+        
+        # Trigger deflection on sliding window
+        engine.evaluate_and_process("", tool, args)
+        _, deflection_json = engine.evaluate_and_process("", tool, {"command": "sed -n '11,20p' file.go"})
+        cmd = json.loads(deflection_json)["command"]
+        
+        # Verify with bash -n (syntax check)
+        import subprocess
+        res = subprocess.run(["bash", "-n", "-c", cmd], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, f"Deflection command failed bash syntax check: {res.stderr}")
+
 if __name__ == "__main__":
     unittest.main()
