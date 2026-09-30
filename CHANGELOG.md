@@ -4,6 +4,17 @@ All notable changes, fixes, and context notes are recorded here to track the evo
 
 ---
 
+## [KV-Cache Tensor Truncation & Repetition Penalty Loop Guard] - 2026-09-30
+
+### 1. `tq_server.py`
+- **Bug Fixed (KV-Cache Ghost Tail Desynchronization)**: In `_shift_cache_offset`, previously only `layer.offset` was shifted, leaving stale key/value tensors from previous generation turns untouched in Apple Metal memory. Now invokes `layer.trim(...)` when supported by `mlx_lm`, and explicitly slices `layer.keys` and `layer.values` (`[..., :offset_val, :]`), preventing RoPE positional phase drift and autoregressive repetition loops on multi-byte tokens.
+- **Feature (Repetition Penalty CLI)**: Added `--repetition-penalty` CLI flag (default `1.12`) to prevent deterministic greedy decoding sinkholes on repeated vocabulary tokens.
+
+### 2. `stream_bridge.py`
+- **Feature (Generator Forwarding)**: Updated `sync_generation_worker` and `async_queue_bridge` to pass `repetition_penalty` directly into `mlx_lm.stream_generate` with backwards-compatible argument fallback.
+
+---
+
 ## [Configurable Free Repetitions Limit for Exact Repeats & Sliding Windows] - 2026-09-27
 
 ### 1. `tq_server.py`

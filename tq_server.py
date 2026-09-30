@@ -25,6 +25,7 @@ parser.add_argument("--max-tokens", type=int, default=4096)
 parser.add_argument("--prefill-step-size", type=int, default=512)
 parser.add_argument("--log-level", type=str, default="info", choices=["info", "debug", "warning", "error"])
 parser.add_argument("--anti-loop-free-limit", "--free-loop-limit", type=int, default=int(os.environ.get("ANTI_LOOP_FREE_HITS", "5")), help="Number of free repetitions allowed before anti-loop escalation (default: 5)")
+parser.add_argument("--repetition-penalty", type=float, default=1.12, help="Penalty for repeating tokens to prevent loops (default: 1.12)")
 args, unknown = parser.parse_known_args()
 
 numeric_level = getattr(logging, args.log_level.upper(), logging.INFO)
@@ -199,12 +200,32 @@ def _make_fresh_cache():
 
 def _shift_cache_offset(cache_registry: list, offset_val: int):
     for layer in cache_registry:
+        current_len = getattr(layer, "offset", getattr(layer, "step", None))
+        if hasattr(layer, "trim") and current_len is not None and current_len > offset_val:
+            try:
+                layer.trim(current_len - offset_val)
+                continue
+            except Exception:
+                pass
+
+        # Прямая чистка тензоров keys/values для исключения старого мусора
+        if hasattr(layer, "keys") and layer.keys is not None:
+            try:
+                layer.keys = layer.keys[..., :offset_val, :]
+            except Exception:
+                pass
+        if hasattr(layer, "values") and layer.values is not None:
+            try:
+                layer.values = layer.values[..., :offset_val, :]
+            except Exception:
+                pass
+
         if hasattr(layer, "offset"): layer.offset = offset_val
         elif hasattr(layer, "step"): layer.step = offset_val
 
 async def _bridge(prompt_ids, max_tokens, r_id, has_tools, cache_obj, total_len):
     try:
-        async for chunk in async_queue_bridge(model, tokenizer, prompt_ids, max_tokens, r_id, has_tools, args.prefill_step_size, cache_obj, args.model, total_len, None):
+        async for chunk in async_queue_bridge(model, tokenizer, prompt_ids, max_tokens, r_id, has_tools, args.prefill_step_size, cache_obj, args.model, total_len, None, args.repetition_penalty):
             yield chunk
     finally:
         if ASYNC_SERVER_LOCK.locked():

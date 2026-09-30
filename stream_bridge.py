@@ -39,7 +39,7 @@ def _parse_xml_arguments(full_text: str) -> dict:
     return args_dict
 
 
-def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id, has_tools, prefill_step_size, global_cache, queue, loop, model_name, prompt_tokens_len, server_lock):
+def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id, has_tools, prefill_step_size, global_cache, queue, loop, model_name, prompt_tokens_len, server_lock, repetition_penalty=1.12):
     """Background worker executing inside Starlette run_in_threadpool context."""
     logger.debug(f"🚀 Entering sync_generation_worker for request: {request_id}")
     
@@ -60,10 +60,24 @@ def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id,
         
         with mx.StreamContext(mx.default_stream(mx.gpu)):
             logger.debug("Initializing mlx_lm.generate.stream_generate loop instance...")
-            generator_instance = stream_generate(
-                model, tokenizer, prompt=prompt_ids, max_tokens=max_tokens, 
-                prompt_cache=global_cache, prefill_step_size=prefill_step_size
-            )
+            # Передаем repetition_penalty если поддерживается версией mlx_lm
+            gen_kwargs = {
+                "prompt": prompt_ids,
+                "max_tokens": max_tokens,
+                "prompt_cache": global_cache,
+                "prefill_step_size": prefill_step_size
+            }
+            if repetition_penalty and repetition_penalty > 1.0:
+                gen_kwargs["repetition_penalty"] = repetition_penalty
+
+            try:
+                generator_instance = stream_generate(model, tokenizer, **gen_kwargs)
+            except TypeError:
+                # Фоллбэк если сигнатура stream_generate в старой версии не принимает repetition_penalty напрямую
+                generator_instance = stream_generate(
+                    model, tokenizer, prompt=prompt_ids, max_tokens=max_tokens, 
+                    prompt_cache=global_cache, prefill_step_size=prefill_step_size
+                )
 
             try:
                 first_response = next(generator_instance)
@@ -244,14 +258,14 @@ def sync_generation_worker(model, tokenizer, prompt_ids, max_tokens, request_id,
 
 
 
-async def async_queue_bridge(model, tokenizer, prompt_ids, max_tokens, request_id, has_tools, prefill_step_size, global_cache, model_name, prompt_tokens_len, server_lock):
+async def async_queue_bridge(model, tokenizer, prompt_ids, max_tokens, request_id, has_tools, prefill_step_size, global_cache, model_name, prompt_tokens_len, server_lock, repetition_penalty=1.12):
     from starlette.concurrency import run_in_threadpool
     queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
     asyncio.create_task(
         run_in_threadpool(
             sync_generation_worker, model, tokenizer, prompt_ids, max_tokens, request_id, has_tools, 
-            prefill_step_size, global_cache, queue, loop, model_name, prompt_tokens_len, server_lock
+            prefill_step_size, global_cache, queue, loop, model_name, prompt_tokens_len, server_lock, repetition_penalty
         )
     )
     while True:
