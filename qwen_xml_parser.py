@@ -14,39 +14,47 @@ class QwenXmlParser:
         self.tool_name = ""
         self.raw_accumulated_text = ""
 
-    def parse_chunk(self, chunk_text: str):
+    def parse_chunk(self, chunk_text: str) -> bool:
         """Accumulates incoming execution tokens and monitors function calling status flags."""
         self.raw_accumulated_text += chunk_text
         
-        # Intercept the structural tag to confirm an active function invocation state
         if "<tool_call>" in self.raw_accumulated_text and not self.in_tool_call:
             self.in_tool_call = True
-            # Attempt to pull out the extracted function execution target name
+            
+        if self.in_tool_call and not self.tool_name:
             func_match = re.search(r'<function=([^>]+)>', self.raw_accumulated_text)
             if func_match:
-                self.tool_name = func_match.group(1).strip()
+                self.tool_name = func_match.group(1).strip().strip("'\"")
                 
         return self.in_tool_call
 
-    def extract_final_arguments(self) -> str:
+    def extract_arguments_dict(self) -> dict:
         """
-        Parses the fully accumulated token block text to extract a flat JSON string dictionary.
-        Returns a guaranteed valid, stringified JSON parameter object schema for Goose.
+        Единый метод извлечения аргументов из XML-вызова Qwen 3.5.
+        Возвращает готовый словарь аргументов без разрушения строковых ID с лидирующими нулями.
         """
-        if not self.tool_name:
-            return "{}"
-            
-        # Extract parameter blocks bounded by <parameter=name>value</parameter> sequence wrappers
-        param_matches = re.findall(r'<parameter=([^>]+)>(.*?)(?:</parameter>|$)', self.raw_accumulated_text, re.DOTALL)
+        param_matches = re.findall(
+            r'<parameter=([^>]+)>(.*?)(?:</parameter>|$)',
+            self.raw_accumulated_text,
+            re.DOTALL
+        )
         
         args_dict = {}
         for p_name, p_val in param_matches:
+            key = p_name.strip()
             clean_val = p_val.replace("</parameter>", "").strip()
-            # Handle native casting for scalar integers while passing remainder targets as raw text strings
-            if clean_val.isdigit():
-                args_dict[p_name.strip()] = int(clean_val)
-            else:
-                args_dict[p_name.strip()] = clean_val
-                
-        # Return strict sanitized data sequence to prevent upstream mapping structure corruption
-        return json.dumps(args_dict, ensure_ascii=False)
+            
+            # Конвертируем только чистые целые числа без лидирующих нулей (например, line_number = 42, но не "0012")
+            if re.fullmatch(r'-?(?:0|[1-9]\d*)', clean_val):
+                try:
+                    args_dict[key] = int(clean_val)
+                    continue
+                except ValueError:
+                    pass
+            elif clean_val in ("true", "false"):
+                args_dict[key] = (clean_val == "true")
+                continue
+
+            args_dict[key] = clean_val
+            
+        return args_dict

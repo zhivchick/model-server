@@ -60,28 +60,31 @@ def apply_pre_call_hooks(body: dict) -> tuple:
                 clean_msg["tool_calls"] = hf_calls
         fixed_messages.append(clean_msg)
 
-    # 🎯 Prompt-level User Intervention перед генерацией шагов оператора (Exact: 3/5 и 4/5, Fuzzy: 4/6 и 5/6)
+    # 🎯 Prompt-level User Intervention (оставляем role: "user", т.к. на него максимальное внимание модели)
     from anti_loop import anti_loop_engine, C_BOLD, C_CYAN, C_YELLOW, C_RESET
     intervention = anti_loop_engine.get_user_intervention_info()
     if intervention:
         step_label, warning_tag, user_intervention_text = intervention
-        # Добавляем роль 'user' в конец контекста (вызывает сдвиг last_query_index в Jinja)
         fixed_messages.append({"role": "user", "content": user_intervention_text})
         logger.warning(
             f"{C_BOLD}{C_CYAN}👤 [USER INTERVENTION INJECTED - {step_label}]{C_RESET} {C_YELLOW}Повтор {step_label}: "
-            f"Внедряем прямое указание оператора [{warning_tag}] в контекст модели. "
-            f"(Примечание: роль user сдвигает last_query_index в Jinja, вызывая штатный сброс кэша из-за очистки устаревших <think> блоков).{C_RESET}"
+            f"Внедряем прямое указание оператора [{warning_tag}] с ролью user.{C_RESET}"
         )
 
-    # 🎯 Enforce reasoning suppression across all template layout arguments
+    # 🎯 Выключаем генерацию <think>, но включаем preserve_thinking=True,
+    # чтобы при добавлении role: "user" Jinja-шаблон НЕ вырезал старые теги и НЕ сбрасывал KV-кэш!
     template_kwargs = {
         "tokenize": False,
         "add_generation_prompt": True,
         "thinking": False,
         "enable_thinking": False,
+        "preserve_thinking": True,
+        "preserve_reasoning": True,
         "chat_template_args": {
             "enable_thinking": False,
-            "thinking": False
+            "thinking": False,
+            "preserve_thinking": True,
+            "preserve_reasoning": True
         }
     }
     
