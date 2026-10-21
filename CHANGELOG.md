@@ -4,9 +4,17 @@ All notable changes, fixes, and context notes are recorded here to track the evo
 
 ---
 
-## [KV-Cache Tensor Truncation & Repetition Penalty Loop Guard] - 2026-09-30
+## [KV-Cache Tensor Truncation, Repetition Penalty & Bash Deflection Escaping] - 2026-09-30
 
-### 1. `tq_server.py`
+### 1. `anti_loop.py`
+- **Bug Fixed (Bash Syntax Error on Deflection Messages)**: Replaced naive `.replace("'", "\\'")` with `shlex.quote(...)` for constructing `echo ... && exit 1` deflection commands. Previously, unescaped nested single quotes around hints (e.g. `using 'cat' or 'grep -n'`) broke bash single-quote string boundaries, triggering `bash: syntax error near unexpected token ')'` (exit code 2) instead of safely returning `Execution Error` (exit code 1).
+- **Bug Fixed (Idle Edit Warning Escaping)**: Wrapped idle edit warnings with `shlex.quote` as well.
+- **Unified Repetition Logic Preserved**: Maintained identical free repetitions and escalation matrix across both exact repeats and sliding window pagination.
+
+### 2. `test_anti_loop.py`
+- **Unit Tests**: Added `test_deflection_command_bash_syntax_validity` verifying deflection commands pass `bash -n -c <cmd>` syntax checks cleanly.
+
+### 3. `tq_server.py`
 - **Bug Fixed (KV-Cache Ghost Tail Desynchronization)**: In `_shift_cache_offset`, previously only `layer.offset` was shifted, leaving stale key/value tensors from previous generation turns untouched in Apple Metal memory. Now invokes `layer.trim(...)` when supported by `mlx_lm`, and explicitly slices `layer.keys` and `layer.values` (`[..., :offset_val, :]`), preventing RoPE positional phase drift and autoregressive repetition loops on multi-byte tokens.
 - **Feature (Repetition Penalty CLI)**: Added `--repetition-penalty` CLI flag (default `1.12`) to prevent deterministic greedy decoding sinkholes on repeated vocabulary tokens.
 

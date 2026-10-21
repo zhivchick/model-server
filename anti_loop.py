@@ -2,6 +2,7 @@ import os
 import re
 import json
 import logging
+import shlex
 
 logger = logging.getLogger("mlx_lm_server.antiloop")
 
@@ -325,8 +326,8 @@ class AntiLoopEngine:
                             f"Your previous call produced identical results. Change parameters or use another tool to proceed."
                         )
                 
-            safe_payload = payload_text.replace("'", "\\'")
-            shell_cmd = f"echo '{safe_payload}' && exit 1"
+            quoted_payload = shlex.quote(payload_text)
+            shell_cmd = f"echo {quoted_payload} && exit 1"
             return forced_tool_name, json.dumps({"command": shell_cmd}, ensure_ascii=False)
 
         else:
@@ -344,10 +345,11 @@ class AntiLoopEngine:
         if is_idle_edit:
             logger.error(f"{C_YELLOW}🚨 [EDIT IDLE DETECTED] Модель прислала идентичные блоки на витке 0. Отклоняем.{C_RESET}")
             forced_tool_name = "shell"
-            idle_warning_text = (
-                "echo 'Execution Error: The \"before\" and \"after\" parameters are byte-for-byte identical. "
-                "Your edit action did NOT change any code. Rewrite your \"after\" block to apply real modifications or use another tool.' && exit 1"
-                )
+            idle_payload = (
+                "Execution Error: The \"before\" and \"after\" parameters are byte-for-byte identical. "
+                "Your edit action did NOT change any code. Rewrite your \"after\" block to apply real modifications or use another tool."
+            )
+            idle_warning_text = f"echo {shlex.quote(idle_payload)} && exit 1"
             return forced_tool_name, json.dumps({"command": idle_warning_text}, ensure_ascii=False)
 
         logger.info(f"Generated Tool Call: '{tool_name}' with args: {final_json_args}")
