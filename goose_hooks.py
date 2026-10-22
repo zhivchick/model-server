@@ -80,6 +80,7 @@ def apply_pre_call_hooks(body: dict) -> tuple:
         "enable_thinking": False,
         "preserve_thinking": True,
         "preserve_reasoning": True,
+        # Жестко фиксируем поведение пустых блоков в шаблоне, чтобы они не плавали от шага к шагу
         "chat_template_args": {
             "enable_thinking": False,
             "thinking": False,

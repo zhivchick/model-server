@@ -39,7 +39,7 @@ def sync_generation_worker(
     repetition_penalty=1.0,
     kv_bits=8,
     kv_group_size=64,
-    quantized_kv_start=1024,
+    quantized_kv_start=32768,
     on_generation_complete=None
 ):
     """Background worker executing inside Starlette run_in_threadpool context."""
@@ -68,7 +68,7 @@ def sync_generation_worker(
                 "prompt_cache": global_cache,
                 "prefill_step_size": prefill_step_size,
             }
-            # Нативное квантование KV-кэша в mlx_lm (для 8 attention-слоев Qwen 3.5)
+            # Нативное квантование KV-кэша в mlx_lm (включается только когда контекст > quantized_kv_start)
             if kv_bits and kv_bits > 0:
                 gen_kwargs["kv_bits"] = kv_bits
                 gen_kwargs["kv_group_size"] = kv_group_size
@@ -100,16 +100,13 @@ def sync_generation_worker(
                 current_prefill_speed = chunk_len / prefill_time if prefill_time > 0 else 0.0
                 
                 is_tool = parser.parse_chunk(token) if has_tools else False
+                sys.stdout.write(token)
+                sys.stdout.flush()
                 if not is_tool:
-                    sys.stdout.write(token)
-                    sys.stdout.flush()
                     asyncio.run_coroutine_threadsafe(
                         queue.put(build_streaming_chunk(request_id=request_id, model_name=model_name, content=token)),
                         loop
                     )
-                else:
-                    sys.stdout.write(token)
-                    sys.stdout.flush()
             except StopIteration:
                 return
 
@@ -122,7 +119,6 @@ def sync_generation_worker(
                 full_response_text += token
                 tokens_count += 1
                 
-                # Нативный XML-парсер Qwen 3.5
                 in_tool_call = parser.parse_chunk(token) if has_tools else False
                 sys.stdout.write(token)
                 sys.stdout.flush()
@@ -139,8 +135,6 @@ def sync_generation_worker(
         generation_time = time.time() - generation_start_time
         current_decode_speed = tokens_count / generation_time if generation_time > 0 else 0.0
 
-        # Дописываем сгенерированные токены в PREVIOUS_AGENT_IDS / PREVIOUS_COMPACTION_IDS,
-        # чтобы на следующем витке не обрезать и не пересчитывать ответ самого ассистента!
         if on_generation_complete and generated_token_ids:
             on_generation_complete(generated_token_ids)
 
@@ -153,7 +147,6 @@ def sync_generation_worker(
                 full_response_text, tool_invocation_name, extracted_args
             )
             
-            # Сценарий 1: Жесткий вылет по повторам (Dialogue Brake)
             if t_name is None:
                 asyncio.run_coroutine_threadsafe(
                     queue.put(build_streaming_chunk(
@@ -166,7 +159,6 @@ def sync_generation_worker(
                     )),
                     loop
                 )
-            # Сценарий 2 и 3: Штатный ход или подмена ответа шелла
             else:
                 asyncio.run_coroutine_threadsafe(
                     queue.put(build_streaming_chunk(
@@ -203,6 +195,11 @@ def sync_generation_worker(
     except Exception as e:
         logger.exception(f"Critical exception inside GPU worker execution loop: {str(e)}")
     finally:
+        # Освобождаем неиспользуемые буферы пула Metal после каждого запроса
+        try:
+            mx.clear_cache()
+        except Exception:
+            pass
         asyncio.run_coroutine_threadsafe(queue.put(None), loop)
         logger.info(f"[GPU RELEASED] Request {request_id} execution finalized.")
         print("-" * 60)
@@ -222,7 +219,7 @@ async def async_queue_bridge(
     repetition_penalty=1.0,
     kv_bits=8,
     kv_group_size=64,
-    quantized_kv_start=1024,
+    quantized_kv_start=32768,
     on_generation_complete=None
 ):
     from starlette.concurrency import run_in_threadpool
