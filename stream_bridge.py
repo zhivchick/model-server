@@ -39,7 +39,7 @@ def sync_generation_worker(
     repetition_penalty=1.0,
     kv_bits=8,
     kv_group_size=64,
-    quantized_kv_start=32768,
+    quantized_kv_start=65536,
     on_generation_complete=None
 ):
     """Background worker executing inside Starlette run_in_threadpool context."""
@@ -47,14 +47,20 @@ def sync_generation_worker(
     
     mx.set_default_device(mx.gpu)
     is_utility = not has_tools
+    chunk_len = len(prompt_ids)
     
-    # Стартовый лог и замер времени префилла
-    if not is_utility and len(prompt_ids) <= prefill_step_size:
+    # Если префилл короткий (<= 1 шага), выводим шапку сразу; иначе сначала покажем прогресс-бар
+    if chunk_len <= prefill_step_size:
         _log_stream_start(request_id, is_utility, prompt_tokens_len)
+    else:
+        print("-" * 60)
+        if is_utility:
+            logger.info(f"[GPU LOCK] Utility request {request_id} acquired exclusive GPU access (prefill={chunk_len} tok).")
+        else:
+            logger.info(f"[GPU LOCK] Main agent {request_id} acquired exclusive GPU access (prefill={chunk_len} tok).")
     
     current_prefill_speed = 0.0
     current_decode_speed = 0.0
-    chunk_len = len(prompt_ids)
     generated_token_ids = []
     
     try:
@@ -63,16 +69,24 @@ def sync_generation_worker(
         parser = QwenXmlParser()
         
         prefill_start_time = time.perf_counter()
+        pure_prefill_elapsed = 0.0
+        pure_prefill_tokens = 0
         
         with mx.StreamContext(mx.default_stream(mx.gpu)):
             
-            # ⏳ Коллбэк для отображения живого прогресса префилла в консоли сервера
+            # ⏳ Коллбэк прогресса префилла (работает и для AGENT, и для UTILITY/COMPACT!)
             def _prefill_progress(processed: int, total: int):
-                if total > prefill_step_size and not is_utility:
+                nonlocal pure_prefill_elapsed, pure_prefill_tokens
+                elapsed = time.perf_counter() - prefill_start_time
+                pure_prefill_elapsed = elapsed
+                pure_prefill_tokens = processed
+                if total > prefill_step_size:
                     pct = int(processed * 100 / total)
-                    elapsed = time.perf_counter() - prefill_start_time
                     spd = processed / elapsed if elapsed > 0 else 0.0
-                    sys.stdout.write(f"\r⏳ Prefill: [{pct:3d}%] {processed}/{total} tokens ({spd:.0f} t/s)... ")
+                    tag = "Compact/Util" if is_utility else "Agent"
+                    sys.stdout.write(
+                        f"\r⏳ [{tag} Prefill: {pct:3d}%] {processed}/{total} tokens ({spd:.1f} t/s)... "
+                    )
                     sys.stdout.flush()
 
             gen_kwargs = {
@@ -105,22 +119,28 @@ def sync_generation_worker(
 
             try:
                 first_response = next(generator_instance)
+                total_ttft = time.perf_counter() - prefill_start_time
                 
-                # Если префилл был большим, стираем строку прогресса и выводим заголовок агента
-                if chunk_len > prefill_step_size and not is_utility:
-                    sys.stdout.write("\r" + " " * 75 + "\r")
-                    _log_stream_start(request_id, is_utility, prompt_tokens_len)
-                elif is_utility:
-                    _log_stream_start(request_id, is_utility, prompt_tokens_len)
+                # Если префилл шел с прогресс-баром, затираем его и рисуем финальную строку стрима
+                if chunk_len > prefill_step_size:
+                    sys.stdout.write("\r" + " " * 78 + "\r")
+                    if is_utility:
+                        print(f"⚙️ [Utility Stream | Context: {prompt_tokens_len} tokens] ", end="")
+                    else:
+                        print(f"🖥️ [Agent Stream | Context: {prompt_tokens_len} tokens] ", end="")
+                    sys.stdout.flush()
 
-                prefill_time = time.perf_counter() - prefill_start_time
                 token = first_response.text
                 if hasattr(first_response, "token"):
                     generated_token_ids.append(int(first_response.token))
                 full_response_text += token
                 tokens_count += 1
                 
-                current_prefill_speed = chunk_len / prefill_time if prefill_time > 0 else 0.0
+                # Считаем честную скорость префилла (на больших чанках — по чистому времени префилла из колбэка)
+                if pure_prefill_tokens > 0 and pure_prefill_elapsed > 0:
+                    current_prefill_speed = pure_prefill_tokens / pure_prefill_elapsed
+                else:
+                    current_prefill_speed = chunk_len / total_ttft if total_ttft > 0 else 0.0
                 
                 is_tool = parser.parse_chunk(token) if has_tools else False
                 sys.stdout.write(token)
@@ -133,7 +153,7 @@ def sync_generation_worker(
             except StopIteration:
                 return
 
-            generation_start_time = time.time()
+            generation_start_time = time.perf_counter()
 
             for response in generator_instance:
                 token = response.text
@@ -155,8 +175,10 @@ def sync_generation_worker(
                 )
 
         print()
-        generation_time = time.time() - generation_start_time
-        current_decode_speed = tokens_count / generation_time if generation_time > 0 else 0.0
+        generation_time = time.perf_counter() - generation_start_time
+        # Первый токен уже был получен до generation_start_time, поэтому считаем (tokens_count - 1) / generation_time
+        decode_tokens = max(1, tokens_count - 1) if tokens_count > 1 else tokens_count
+        current_decode_speed = decode_tokens / generation_time if generation_time > 0 else 0.0
 
         if on_generation_complete and generated_token_ids:
             on_generation_complete(generated_token_ids)
@@ -242,7 +264,7 @@ async def async_queue_bridge(
     repetition_penalty=1.0,
     kv_bits=8,
     kv_group_size=64,
-    quantized_kv_start=32768,
+    quantized_kv_start=65536,
     on_generation_complete=None
 ):
     from starlette.concurrency import run_in_threadpool
