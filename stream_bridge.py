@@ -47,7 +47,10 @@ def sync_generation_worker(
     
     mx.set_default_device(mx.gpu)
     is_utility = not has_tools
-    _log_stream_start(request_id, is_utility, prompt_tokens_len)
+    
+    # Стартовый лог и замер времени префилла
+    if not is_utility and len(prompt_ids) <= prefill_step_size:
+        _log_stream_start(request_id, is_utility, prompt_tokens_len)
     
     current_prefill_speed = 0.0
     current_decode_speed = 0.0
@@ -62,13 +65,25 @@ def sync_generation_worker(
         prefill_start_time = time.perf_counter()
         
         with mx.StreamContext(mx.default_stream(mx.gpu)):
+            
+            # ⏳ Коллбэк для отображения живого прогресса префилла в консоли сервера
+            def _prefill_progress(processed: int, total: int):
+                if total > prefill_step_size and not is_utility:
+                    pct = int(processed * 100 / total)
+                    elapsed = time.perf_counter() - prefill_start_time
+                    spd = processed / elapsed if elapsed > 0 else 0.0
+                    sys.stdout.write(f"\r⏳ Prefill: [{pct:3d}%] {processed}/{total} tokens ({spd:.0f} t/s)... ")
+                    sys.stdout.flush()
+
             gen_kwargs = {
                 "prompt": prompt_ids,
                 "max_tokens": max_tokens,
                 "prompt_cache": global_cache,
                 "prefill_step_size": prefill_step_size,
+                "prompt_progress_callback": _prefill_progress,
             }
-            # Нативное квантование KV-кэша в mlx_lm (включается только когда контекст > quantized_kv_start)
+            
+            # Нативное квантование KV-кэша в mlx_lm
             if kv_bits and kv_bits > 0:
                 gen_kwargs["kv_bits"] = kv_bits
                 gen_kwargs["kv_group_size"] = kv_group_size
@@ -90,6 +105,14 @@ def sync_generation_worker(
 
             try:
                 first_response = next(generator_instance)
+                
+                # Если префилл был большим, стираем строку прогресса и выводим заголовок агента
+                if chunk_len > prefill_step_size and not is_utility:
+                    sys.stdout.write("\r" + " " * 75 + "\r")
+                    _log_stream_start(request_id, is_utility, prompt_tokens_len)
+                elif is_utility:
+                    _log_stream_start(request_id, is_utility, prompt_tokens_len)
+
                 prefill_time = time.perf_counter() - prefill_start_time
                 token = first_response.text
                 if hasattr(first_response, "token"):
@@ -195,7 +218,7 @@ def sync_generation_worker(
     except Exception as e:
         logger.exception(f"Critical exception inside GPU worker execution loop: {str(e)}")
     finally:
-        # Освобождаем неиспользуемые буферы пула Metal после каждого запроса
+        # Очищаем неиспользуемые буферы пула Metal после каждого запроса
         try:
             mx.clear_cache()
         except Exception:
