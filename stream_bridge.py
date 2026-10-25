@@ -73,6 +73,15 @@ def sync_generation_worker(
         pure_prefill_tokens = 0
         
         with mx.StreamContext(mx.default_stream(mx.gpu)):
+            # 🛡️ ЗАЩИТА ОТ ПИКОВОГО ВЗРЫВА VRAM НА БОЛЬШОМ КОНТЕКСТЕ:
+            # На контексте > 30k матрица внимания при шаге 1024 требует гигабайты временных буферов Metal.
+            # Снижаем шаг префилла до 256/512 токенов — пик памяти падает в 4 раза!
+            effective_step_size = prefill_step_size
+            if prompt_tokens_len > 40000:
+                effective_step_size = min(prefill_step_size, 512)
+            elif prompt_tokens_len > 25000:
+                effective_step_size = min(prefill_step_size, 1024)
+
             
             # ⏳ Коллбэк прогресса префилла (работает и для AGENT, и для UTILITY/COMPACT!)
             def _prefill_progress(processed: int, total: int):
@@ -80,7 +89,7 @@ def sync_generation_worker(
                 elapsed = time.perf_counter() - prefill_start_time
                 pure_prefill_elapsed = elapsed
                 pure_prefill_tokens = processed
-                if total > prefill_step_size:
+                if total > effective_step_size :
                     pct = int(processed * 100 / total)
                     spd = processed / elapsed if elapsed > 0 else 0.0
                     tag = "Compact/Util" if is_utility else "Agent"
@@ -89,11 +98,13 @@ def sync_generation_worker(
                     )
                     sys.stdout.flush()
 
+
+
             gen_kwargs = {
                 "prompt": prompt_ids,
                 "max_tokens": max_tokens,
                 "prompt_cache": global_cache,
-                "prefill_step_size": prefill_step_size,
+                "prefill_step_size": effective_step_size,
                 "prompt_progress_callback": _prefill_progress,
             }
             

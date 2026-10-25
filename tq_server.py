@@ -16,10 +16,13 @@ import mlx_lm
 from mlx_lm.models.cache import make_prompt_cache, can_trim_prompt_cache, trim_prompt_cache
 from goose_hooks import apply_pre_call_hooks
 from stream_bridge import async_queue_bridge
+import faulthandler
 
 # ------------------------------------------------------------
 # ⚙️ НАСТРОЙКИ И ИНИЦИАЛИЗАЦИЯ
 # ------------------------------------------------------------
+
+faulthandler.enable()
 parser = argparse.ArgumentParser(description="Stateful Multi-Session MLX Server")
 parser.add_argument("--model", type=str, required=True)
 parser.add_argument("--host", type=str, default="127.0.0.1")
@@ -197,16 +200,13 @@ def _find_uncached_history_delta(server_cache_text: str, goose_history_body: str
 
 def _build_compaction_hijack_tail(messages: list, server_cache_text: str) -> str:
     """
-    Формирует компактный хвост-инъекцию в конец AGENT_CACHE:
-    1) Закрывает открытый в кэше <|im_start|>assistant
-    2) Передает только некэшированную дельту последнего шага + схему JSON от Goose
-    3) Защищает от повторного перечитывания уже изученных файлов после компакта
+    Гибридный вариант1 + точная дельта:
+    - Сохраняет первые 2500 символов системного промпта Goose (Task Context + старт истории с путями ../../docs/),
+      которые служат якорем контекста при суммаризации.
+    - Вместо слепого среза [-3000:] добавляет точную некэшированную дельту последнего шага и полную схему JSON.
     """
-    msg_summary = [(m.get("role"), len(str(m.get("content", "")))) for m in messages]
-    logger.info(f"🔍 [COMPACT INSPECT] Incoming messages structure: {msg_summary}")
-
     sys_text = ""
-    user_trigger = "Please summarize the conversation history above."
+    user_trigger = "Please summarize the conversation history provided in the system prompt."
     for m in messages:
         if m.get("role") == "system" and m.get("content"):
             sys_text = str(m["content"]).strip()
@@ -216,36 +216,37 @@ def _build_compaction_hijack_tail(messages: list, server_cache_text: str) -> str
     history_marker = "**Conversation History:**"
     schema_marker = "Wrap reasoning in `<analysis>` tags:"
 
-    header_part = ""
-    schema_part = ""
-    uncached_delta = ""
-
     if history_marker in sys_text and schema_marker in sys_text:
-        header_part, rest = sys_text.split(history_marker, 1)
+        _, rest = sys_text.split(history_marker, 1)
         history_body, schema_tail = rest.rsplit(schema_marker, 1)
         schema_part = schema_marker + schema_tail
         uncached_delta = _find_uncached_history_delta(server_cache_text, history_body)
+
+        # Берем первые 2500 символов sys_text (как в первом удачном варианте!),
+        # чтобы модель видела Task Context и первые шаги истории (пути к ../../docs/ и стиль ответов)
+        head_anchor = sys_text[:2500]
+
+        body_str = (
+            f"[SYSTEM INSTRUCTION (HEAD + EXACT DELTA + SCHEMA)]\n"
+            f"{head_anchor}\n...\n"
+            f"{uncached_delta}\n\n"
+            f"{schema_part.strip()}\n\n"
+            f"[USER TRIGGER]\n{user_trigger}"
+        )
     else:
-        schema_part = sys_text
+        body_str = f"{sys_text[:3000]}\n...\n{sys_text[-3000:]}\n\n[USER TRIGGER]\n{user_trigger}"
 
-    delta_section = (
-        f"**Latest Step Executed Just Before Compaction:**\n{uncached_delta}\n\n"
-        if uncached_delta else ""
-    )
-
-
+    # Точно такая же обертка, как в первом варианте (без искусственного <|im_end|> в начале)
     hijack_tail_str = (
-        f"<|im_end|>\n"
-        f"<|im_start|>user\n"
-        f"[SYSTEM OVERRIDE: CONTEXT COMPACTION]\n"
-        f"Do NOT call any tools or output XML tool_call tags.\n\n"
-        f"{header_part.strip()}\n\n"
-        f"{delta_section}"
-        f"{schema_part.strip()}\n"
-        f"{user_trigger}<|im_end|>\n"
-        f"<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        "<|im_start|>user\n"
+        "[SYSTEM OVERRIDE: CONTEXT COMPACTION]\n"
+        "Do NOT call any tools or output XML tags. "
+        "Follow these instructions to summarize our entire conversation above:\n\n"
+        f"{body_str}<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"
     )
     return hijack_tail_str
+
 
 
 def _dump_compaction_debug_logs(
@@ -469,7 +470,8 @@ def _get_cache_offset(cache_registry: list) -> int:
 
 def _try_align_cache(cache_registry: list, matched_tokens_len: int) -> tuple[bool, int]:
     """
-    Безопасно подрезает сгенерированный хвост в кэше до границы прошлого промпта.
+    Безопасно подрезает сгенерированный хвост в кэше до границы прошлого промпта
+    через штатный механизм mlx_lm.
     """
     current_offset = _get_cache_offset(cache_registry)
     if current_offset <= 0:
@@ -481,17 +483,22 @@ def _try_align_cache(cache_registry: list, matched_tokens_len: int) -> tuple[boo
     if tokens_to_trim == 0:
         return True, effective_target
 
-    for layer in cache_registry:
-        if hasattr(layer, "is_trimmable") and layer.is_trimmable():
-            layer.trim(tokens_to_trim)
-        elif hasattr(layer, "offset") and layer.offset is not None:
-            layer.offset = effective_target
+    if can_trim_prompt_cache(cache_registry):
+        trim_prompt_cache(cache_registry, tokens_to_trim)
+    else:
+        for layer in cache_registry:
+            if hasattr(layer, "is_trimmable") and layer.is_trimmable():
+                layer.trim(tokens_to_trim)
+            elif hasattr(layer, "offset") and layer.offset is not None:
+                layer.offset = effective_target
 
+    mx.clear_cache()
     logger.info(
         f"✂️ [CACHE ALIGN] Trimmed {tokens_to_trim} tail tokens "
         f"(cache_offset: {current_offset} -> {effective_target})"
     )
     return True, effective_target
+
 
 async def _bridge(
     prompt_ids,

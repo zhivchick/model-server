@@ -7,8 +7,8 @@ import os
 # ⚙️ НАСТРОЙКИ МОНИТОРА
 SERVER_URL = "http://127.0.0.1:8080/v1/context/raw"
 REFRESH_INTERVAL_SEC = 30
-SAVE_DUMP_PATH = "goose_live_context_dump.txt"  # 💾 Путь для сохранения по Ctrl+S
-# Добавьте импорт на самый верх cache_monitor.py
+SAVE_DUMP_PATH = "goose_live_context_dump.txt"  # 💾 Путь для сохранения по Ctrl+W
+
 try:
     import tiktoken
     # Qwen использует кодировку cl100k_base (как GPT-4) для базового токен-маппинга
@@ -16,41 +16,140 @@ try:
 except Exception:
     _LOCAL_ENCODER = None
 
+
+# 🎯 РЕГУЛЯРКИ ДЛЯ ЧТЕНИЯ ФАЙЛОВ И МУТАЦИЙ
+# 1) cat / head / tail / nl / bat / less / more / view_file (пропускаем любые флаги типа -n 50, -n +20, -ba)
+_READ_CMD_RE = re.compile(
+    r'\b(?P<cmd>cat|head|tail|nl|bat|less|more|view_file)\s+'
+    r'(?:-[a-zA-Z0-9]+\s+(?:[\+\-]?\d+\s+)?)*'
+    r'["\']?(?P<path>[a-zA-Z0-9_\.\/\-\+]+)["\']?',
+    re.IGNORECASE
+)
+
+# 2) sed (исключая sed -i, который является мутацией, пропускаем флаги и скрипт '10,50p')
+_SED_READ_RE = re.compile(
+    r'\bsed\s+(?!-i\b)(?:-[a-zA-Z0-9]+\s+)*(?:["\'][^"\']*["\']\s+)?'
+    r'["\']?(?P<path>[a-zA-Z0-9_\.\/\-\+]+)["\']?',
+    re.IGNORECASE
+)
+
+# 3) git show REV:path или git diff path
+_GIT_READ_RE = re.compile(
+    r'\bgit\s+(?:show\s+[a-zA-Z0-9_\-\~]+:|diff\s+(?:--[a-z\-]+\s+)*)'
+    r'["\']?(?P<path>[a-zA-Z0-9_\.\/\-\+]+)["\']?',
+    re.IGNORECASE
+)
+
+# 4) Нативные чтения файлов через тулы (read / view / analyze на конкретный файл)
+_TOOL_READ_RE = re.compile(
+    r'<function=(?:read_file|view|analyze)>\s*<parameter=path>\s*(?P<path>[^\s<]+)\s*</parameter>',
+    re.IGNORECASE
+)
+
+# 5) Мутации: нативные вызовы edit / write (только внутри <tool_call>)
+_TOOL_MUTATION_RE = re.compile(
+    r'<tool_call>\s*<function=(?:[a-zA-Z0-9_]+__)?(?:edit|write|str_replace_editor)\b',
+    re.IGNORECASE
+)
+
+# 6) Мутации через shell: sed -i, perl -pi, patch, git apply
+_SHELL_MUTATION_RE = re.compile(
+    r'<function=(?:[a-zA-Z0-9_]+__)?shell>.*?'
+    r'(?:\bsed\s+-i\b|\bperl\s+-[a-zA-Z]*i|\bpatch\s+|\bgit\s+apply\b).*?'
+    r'</function>',
+    re.IGNORECASE | re.DOTALL
+)
+
+
+def _is_valid_file_path(file_path: str) -> bool:
+    if not file_path or len(file_path) <= 2 or file_path.startswith("-"):
+        return False
+    if file_path in ("/dev/null", "EOF", "2>&1"):
+        return False
+    return ("." in file_path) or ("/" in file_path)
+
+
+def count_context_mutations(raw_text: str) -> int:
+    """
+    Считает количество реальных изменений (edit, write, sed -i и т.д.),
+    выполненных моделью в текущем окне контекста.
+    """
+    if not raw_text:
+        return 0
+
+    edits_count = 0
+
+    # Считаем только те <tool_call> edit/write, после которых уже есть <tool_response>
+    for match in _TOOL_MUTATION_RE.finditer(raw_text):
+        if raw_text.find("<tool_response>", match.end()) != -1:
+            edits_count += 1
+
+    # Считаем мутирующие shell-команды (sed -i, perl -pi, git apply)
+    for match in _SHELL_MUTATION_RE.finditer(raw_text):
+        if raw_text.find("<tool_response>", match.end()) != -1:
+            edits_count += 1
+
+    return edits_count
+
+
 def parse_and_weight_context(raw_text: str, total_tokens_len: int, token_ids_dummy: list = None) -> list:
     """
-    🎯 ПАРСЕР ПО КОМАНДАМ ТЕРМИНАЛА С ДЕТЕКЦИЕЙ ЧАСТИЧНОЙ ВЫГРУЗКИ (PART)
+    🎯 ПАРСЕР ПО КОМАНДАМ ТЕРМИНАЛА И ТУЛАМ С ДЕТЕКЦИЕЙ ЧАСТИЧНОЙ ВЫГРУЗКИ (PART)
     """
     if not raw_text or total_tokens_len == 0:
         return [("--- empty context ---", total_tokens_len, False, False)]
 
     file_segments = []
     text_len = len(raw_text)
-    # 🎯 ИСПРАВЛЕНO: Убрали grep из детектора выгрузки файлов
-    # 🎯 БРOНЕБOЙНЫЙ ПАТТЕРН: Ловит cat, view_file, а для sed пропускает любые флаги и диапазоны строк ('218,320p')
-    cmd_pattern = r'\b(?:cat|view_file)\s+([a-zA-Z0-9_\.\/\-\+]+)|\bsed\s+.*?\s+([a-zA-Z0-9_\.\/\-\+]+)'
-    
-    for cmd_match in re.finditer(cmd_pattern, raw_text, re.IGNORECASE):
-        # 🎯 ФИКС: Забираем путь либо из первой, либо из второй группы захвата
-        file_path = (cmd_match.group(1) or cmd_match.group(2) or "").strip()
-        
-        if len(file_path) <= 3 or not ('.' in file_path or '/' in file_path):
+
+    candidates = []
+    for m in _READ_CMD_RE.finditer(raw_text):
+        cmd_name = m.group("cmd").lower()
+        candidates.append((m.start(), m.end(), m.group("path").strip(), cmd_name in ("head", "tail")))
+
+    for m in _SED_READ_RE.finditer(raw_text):
+        candidates.append((m.start(), m.end(), m.group("path").strip(), True))
+
+    for m in _GIT_READ_RE.finditer(raw_text):
+        candidates.append((m.start(), m.end(), m.group("path").strip(), "diff" in m.group(0).lower()))
+
+    for m in _TOOL_READ_RE.finditer(raw_text):
+        candidates.append((m.start(), m.end(), m.group("path").strip(), False))
+
+    candidates.sort(key=lambda x: x[0])
+
+    for cmd_start, cmd_end, file_path, forced_partial in candidates:
+        if not _is_valid_file_path(file_path):
             continue
 
-            
-        search_start = cmd_match.end()
-        response_start = raw_text.find("<tool_response>", search_start)
-        if response_start != -1:
-            response_end = raw_text.find("</tool_response>", response_start)
-            if response_end != -1:
-                start_pos = response_start + len("<tool_response>")
-                end_pos = response_end
-                context_before = raw_text[max(0, cmd_match.start()-100):response_start].lower()
-                context_inside = raw_text[start_pos:min(text_len, start_pos+300)].lower()
-                is_partial = any(m in context_before for m in ["head", "tail", "grep", "sed", "lines"]) or \
-                             any(m in context_inside for m in ["lines hidden", "truncated"])
-                
-                if not any(seg["start"] == start_pos for seg in file_segments):
-                    file_segments.append({"name": file_path, "start": start_pos, "end": end_pos, "is_file": True, "is_partial": is_partial})
+        # Ищем ближайший <tool_call> закрывающий тег и следующий за ним <tool_response>,
+        # чтобы не привязать старую команду из диалога к чужому <tool_response> далеко внизу
+        response_start = raw_text.find("<tool_response>", cmd_end)
+        if response_start == -1 or (response_start - cmd_end) > 600:
+            continue
+
+        response_end = raw_text.find("</tool_response>", response_start)
+        if response_end == -1:
+            continue
+
+        start_pos = response_start + len("<tool_response>")
+        end_pos = response_end
+        context_before = raw_text[max(0, cmd_start - 100):response_start].lower()
+        context_inside = raw_text[start_pos:min(text_len, start_pos + 300)].lower()
+        is_partial = (
+            forced_partial
+            or any(m in context_before for m in ["head", "tail", "grep", "sed", "lines", "diff"])
+            or any(m in context_inside for m in ["lines hidden", "truncated"])
+        )
+
+        if not any(seg["start"] == start_pos for seg in file_segments):
+            file_segments.append({
+                "name": file_path,
+                "start": start_pos,
+                "end": end_pos,
+                "is_file": True,
+                "is_partial": is_partial
+            })
 
     file_segments.sort(key=lambda x: x["start"])
     all_segments = []
@@ -69,12 +168,12 @@ def parse_and_weight_context(raw_text: str, total_tokens_len: int, token_ids_dum
     # 📊 ШАГ 3: ЧЕСТНЫЙ ПОДСЧЁТ ВЕСОВ И ФИЛЬТРАЦИЯ СЛOЁВ (< 500t)
     # ============================================================
     result_matrix = []
-    
+
     for seg in all_segments:
         chunk_text = raw_text[seg["start"]:seg["end"]].strip()
         if not chunk_text:
             continue
-            
+
         if _LOCAL_ENCODER is not None:
             try:
                 seg_tokens = len(_LOCAL_ENCODER.encode(chunk_text, allowed_special="all"))
@@ -82,18 +181,14 @@ def parse_and_weight_context(raw_text: str, total_tokens_len: int, token_ids_dum
                 seg_tokens = max(1, len(chunk_text) // 4)
         else:
             seg_tokens = max(1, len(chunk_text) // 4)
-            
+
         if seg_tokens > 0:
-            # 🎯 ФИКС: Если это диалог и он меньше 500 токенов — просто выкидываем его из списка!
-            # Его вес автоматически улетит в верхний бадж усечения при расчёте в draw_tui
             if not seg["is_file"] and seg["name"] == "prompt / dialogue" and seg_tokens < 500:
                 continue
-                
+
             result_matrix.append((seg["name"], seg_tokens, seg["is_file"], seg["is_partial"]))
 
     return result_matrix
-
-
 
 
 def draw_tui(stdscr):
@@ -102,11 +197,11 @@ def draw_tui(stdscr):
     curses.start_color()
     curses.use_default_colors()
 
-    curses.init_pair(1, curses.COLOR_GREEN, -1)   
-    curses.init_pair(2, curses.COLOR_BLUE, -1)    
-    curses.init_pair(3, curses.COLOR_RED, -1)     
-    curses.init_pair(4, curses.COLOR_BLACK, curses.COLOR_CYAN) 
-    curses.init_pair(5, curses.COLOR_YELLOW, -1)  
+    curses.init_pair(1, curses.COLOR_GREEN, -1)
+    curses.init_pair(2, curses.COLOR_BLUE, -1)
+    curses.init_pair(3, curses.COLOR_RED, -1)
+    curses.init_pair(4, curses.COLOR_BLACK, curses.COLOR_CYAN)
+    curses.init_pair(5, curses.COLOR_YELLOW, -1)
 
     last_refresh = 0
     cache_map = [("Waiting...", 0, False, False)]
@@ -117,23 +212,30 @@ def draw_tui(stdscr):
     save_status_msg = ""
     save_status_time = 0
 
-     # 🎯 ФЛАГ ПРИНУДИТЕЛЬНОЙ ОТРИСОВКИ: Взводим True на старте, чтобы нарисовать первый кадр
+    # 📊 СЧЕТЧИКИ ЦИКЛОВ КОМПАКТА И ИЗМЕНЕНИЙ
+    compact_cycle = 0
+    current_pass_edits = 0
+    accumulated_edits = 0
+    prev_total_tokens = 0
+    prev_pass_edits = 0
+    had_summary_marker = False
+    initialized_session = False
+
+    # 🎯 ФЛАГ ПРИНУДИТЕЛЬНОЙ ОТРИСОВКИ
     should_render_frame = True
 
     while True:
         current_time = time.time()
         force_refresh = False
-        
+
         if save_status_msg and (current_time - save_status_time > 2.0):
             save_status_msg = ""
             should_render_frame = True
 
-        # 🎛️ ЖЕЛЕЗОБЕТОННЫЙ ПЕРЕХВАТ КЛАВИШ (ЗАЩИТА ОТ МГНОВЕННОГО ВЫЛЕТА)
+        # 🎛️ ЖЕЛЕЗОБЕТОННЫЙ ПЕРЕХВАТ КЛАВИШ
         try:
             key = stdscr.getch()
-            
-            # Строго проверяем конкретные коды кнопок. 
-            # Если getch() выдал -1 (нет нажатия) или мусор — игнорируем, цикл НЕ прерывается.
+
             if key in [ord('q'), ord('Q')]:
                 break
             elif key == 18:  # Ctrl + R
@@ -150,24 +252,52 @@ def draw_tui(stdscr):
                     save_status_msg = "[EMPTY]"
                 save_status_time = current_time
                 should_render_frame = True
-            elif key == curses.KEY_RESIZE or key == 27:  # Нативный ресайз терминала Mac
-                # Принудительно заставляем curses обновить геометрию экрана
+            elif key == curses.KEY_RESIZE or key == 27:
                 curses.update_lines_cols()
                 should_render_frame = True
         except Exception:
             pass
 
-
         # 🔄 ПОЛЛИНГ СЕРВЕРА (По таймеру или по Ctrl+R)
         if force_refresh or (current_time - last_refresh >= REFRESH_INTERVAL_SEC):
             last_refresh = current_time
-            should_render_frame = True 
+            should_render_frame = True
             try:
                 response = httpx.get(SERVER_URL, timeout=2.0)
                 if response.status_code == 200:
                     data = response.json()
-                    total_tokens = data.get("total_tokens_len", 0)
-                    raw_context_text = data.get("raw_text", "")
+                    new_total_tokens = data.get("total_tokens_len", 0)
+                    new_raw_text = data.get("raw_text", "")
+
+                    has_summary_now = (
+                        "# Conversation Summary" in new_raw_text
+                        or "Your context was compacted." in new_raw_text
+                    )
+                    new_pass_edits = count_context_mutations(new_raw_text)
+
+                    if not initialized_session and new_total_tokens > 0:
+                        initialized_session = True
+                        if has_summary_now:
+                            compact_cycle = 1
+                            had_summary_marker = True
+                    elif initialized_session and new_total_tokens > 0:
+                        # Детектим компакт:
+                        # 1) Контекст резко схлопнулся (было > 8000t и упало более чем на 35%)
+                        # 2) Или впервые появился маркер компакта Goose
+                        is_token_drop = (prev_total_tokens > 8000 and new_total_tokens < prev_total_tokens * 0.65)
+                        is_first_summary = (has_summary_now and not had_summary_marker)
+
+                        if is_token_drop or is_first_summary:
+                            compact_cycle += 1
+                            accumulated_edits += prev_pass_edits
+                            had_summary_marker = has_summary_now
+
+                    total_tokens = new_total_tokens
+                    raw_context_text = new_raw_text
+                    current_pass_edits = new_pass_edits
+                    prev_total_tokens = new_total_tokens
+                    prev_pass_edits = new_pass_edits
+
                     cache_map = parse_and_weight_context(raw_context_text, total_tokens, data.get("token_ids", []))
                     status_ok = True
                     last_update_time = time.strftime('%H:%M:%S')
@@ -180,45 +310,55 @@ def draw_tui(stdscr):
         # 🎯 УЛЬТРА-СТАБИЛЬНЫЙ РЕНДЕР-ДВИЖOК ПО СОБЫТИЮ
         # ============================================================
         if should_render_frame:
-            should_render_frame = False # Сбрасываем флаг до следующего события
-            
+            should_render_frame = False
+
             stdscr.erase()
             h, w = stdscr.getmaxyx()
 
-            if w < 15 or h < 6:
+            if w < 15 or h < 7:
                 stdscr.addstr(0, 0, "Too small")
                 stdscr.refresh()
                 time.sleep(0.2)
                 continue
 
-            # 1. СВЕРХКОМПАКТНАЯ ШАПКА
+            # 1. СВЕРХКОМПАКТНАЯ ДВУХСТРОЧНАЯ ШАПКА
             try:
-                stdscr.addstr(0, 0, "+" + "-"*(w-2) + "+")
+                stdscr.addstr(0, 0, "+" + "-" * (w - 2) + "+")
                 title = " MLX CACHE "
                 if w > len(title) + 6:
-                    stdscr.addstr(0, (w-len(title))//2, title, curses.A_BOLD)
-                
+                    stdscr.addstr(0, (w - len(title)) // 2, title, curses.A_BOLD)
+
+                # Строка 1: Scale + Time
                 stat_indicator = "●" if status_ok else "X"
                 stat_color = curses.color_pair(1) if status_ok else curses.color_pair(3)
-                
+
                 formatted_total = f"{total_tokens:,}".replace(",", ".")
-                stdscr.addstr(1, 1, "| Scale: ")
+                stdscr.addstr(1, 0, "| Scale: ")
                 stdscr.addstr(f"{formatted_total}t", curses.A_BOLD)
                 stdscr.addstr(" ")
                 stdscr.addstr(stat_indicator, stat_color)
-                
+
                 info_str = f" [{last_update_time}]" if not save_status_msg else f" {save_status_msg} "
                 stdscr.addstr(1, max(10, w - len(info_str) - 1), info_str, curses.color_pair(2) if not save_status_msg else curses.color_pair(1) | curses.A_BOLD)
-                stdscr.addstr(1, w-1, "|")
-                stdscr.addstr(2, 0, "+" + "-"*(w-2) + "+")
-            except Exception: pass
+                stdscr.addstr(1, w - 1, "|")
 
-       # ============================================================
+                # Строка 2: Cycle - Edits - All Edits
+                all_edits = accumulated_edits + current_pass_edits
+                stats_line = f" Cycle: {compact_cycle} | Edits: {current_pass_edits} | All Edits: {all_edits}"
+                stdscr.addstr(2, 0, "|")
+                stdscr.addstr(2, 1, stats_line[:max(0, w - 2)], curses.A_BOLD | curses.color_pair(5))
+                stdscr.addstr(2, w - 1, "|")
+
+                stdscr.addstr(3, 0, "+" + "-" * (w - 2) + "+")
+            except Exception:
+                pass
+
+            # ============================================================
             # 🎯 ХИРУРГИЧЕСКИЙ РАСЧЁТ ВЕРХНЕГО БАДЖА (ТОЛЬКО ТО, ЧТО НАВЕРХУ)
             # ============================================================
-            max_visible_rows = h - 5
+            max_visible_rows = h - 6
             seen_files_registry = set()
-            
+
             processed_rows = []
             for name, tokens, is_file, is_partial in cache_map:
                 is_duplicate = False
@@ -233,114 +373,93 @@ def draw_tui(stdscr):
             show_top_truncation_badge = False
             truncated_tokens_sum = 0
 
-            # Бадж появляется СТРОГО тогда, когда строки физически не влезают в высоту окна!
             if max_visible_rows > 0 and len(processed_rows) > max_visible_rows:
                 show_top_truncation_badge = True
-                # Определяем точный индекс, по которому режем экран
                 slice_index = len(processed_rows) - max_visible_rows + 1
-                
-                # 🎯 ЧЕСТНАЯ МАТЕМАТИКА: Суммируем токены СТРОГО тех строк истории (и файлов, и диалогов),
-                # которые физически оказались ВЫШЕ первого отображаемого на экране элемента!
-                for i in range(slice_index):
-                    truncated_tokens_sum += processed_rows[i][1] # Индекс 1 — это число токенов
-                    
-                visible_rows = processed_rows[slice_index:]
-            # =========================================================
 
+                for i in range(slice_index):
+                    truncated_tokens_sum += processed_rows[i][1]
+
+                visible_rows = processed_rows[slice_index:]
 
             # 3. ОТРИСОВКА СПИСКА
-            current_row = 3
+            current_row = 4
             if show_top_truncation_badge and current_row < h - 2:
                 formatted_trunc = f"{truncated_tokens_sum:,}".replace(",", ".")
                 trunc_str = f"<... {formatted_trunc}t before ...>"
                 gap_size = w - len(trunc_str) - 3
-                trunc_line = f"{trunc_str}{' ' * max(0, gap_size)}"[:w-4]
+                trunc_line = f"{trunc_str}{' ' * max(0, gap_size)}"[:w - 4]
                 try:
-                    stdscr.addstr(current_row, 1, "|", curses.color_pair(2))
-                    stdscr.addstr(current_row, 3, trunc_line, curses.color_pair(2))
-                    stdscr.addstr(current_row, w-1, "|")
-                except Exception: pass
+                    stdscr.addstr(current_row, 0, "|", curses.color_pair(2))
+                    stdscr.addstr(current_row, 2, trunc_line, curses.color_pair(2))
+                    stdscr.addstr(current_row, w - 1, "|")
+                except Exception:
+                    pass
                 current_row += 1
 
             for name, tokens, is_file, is_partial, is_duplicate in visible_rows:
                 if current_row >= h - 2:
                     break
-                    
+
                 display_name = name
                 if is_file and is_partial:
                     display_name = f"{name}(part)"
-                    
+
                 token_str = f"~{tokens:,}t".replace(",", ".")
                 max_name_width = w - len(token_str) - 9
-                
+
                 if is_file:
                     clean_name = smart_truncate_path(display_name, max(4, max_name_width))
                 else:
                     clean_name = display_name[:max(4, max_name_width)]
-                    
+
                 gap_size = w - len(clean_name) - len(token_str) - 7
                 full_line_str = f"{clean_name}{' ' * max(0, gap_size)}{token_str}"
-                safe_line = full_line_str[:w-6]
+                safe_line = full_line_str[:w - 6]
 
                 try:
                     if is_file:
                         if is_duplicate:
-                            stdscr.addstr(current_row, 1, "| [D] ", curses.color_pair(5))
+                            stdscr.addstr(current_row, 0, "| [D] ", curses.color_pair(5))
                             stdscr.addstr(safe_line, curses.A_BOLD | curses.color_pair(5))
                         else:
-                            stdscr.addstr(current_row, 1, "| [F] ", curses.color_pair(1))
+                            stdscr.addstr(current_row, 0, "| [F] ", curses.color_pair(1))
                             stdscr.addstr(safe_line, curses.A_BOLD | curses.color_pair(1))
                     else:
-                        stdscr.addstr(current_row, 1, "| [S] ", curses.color_pair(2))
+                        stdscr.addstr(current_row, 0, "| [S] ", curses.color_pair(2))
                         stdscr.addstr(safe_line, curses.color_pair(2))
-                    
-                    stdscr.addstr(current_row, w-1, "|")
-                except Exception: pass
+
+                    stdscr.addstr(current_row, w - 1, "|")
+                except Exception:
+                    pass
                 current_row += 1
 
-              # ============================================================
+            # ============================================================
             # 🎯 СТИЛЬНЫЙ ASCII-ПОДВАЛ (КНОПКИ ВШИТЫ ПРЯМО В РАМКУ)
             # ============================================================
             try:
-                # Базовая нижняя линия
-                base_line = "+" + "-"*(w-2) + "+"
-                
-                # Собираем строку подсказок кнопок
+                base_line = "+" + "-" * (w - 2) + "+"
+
                 hotkeys_str = " ^R:Ref | ^W:Save "
                 if w > 35:
-                    hotkeys_str += "| ^Q:Quit "
-                
-                # Вшиваем подсказки в правую часть нижней рамки, если позволяет ширина
+                    hotkeys_str += "| Q:Quit "
+
                 if w > len(hotkeys_str) + 6:
-                    # Заменяем дефисы рамки на наши кнопки с отступом в 2 символа справа
                     pos = w - len(hotkeys_str) - 2
                     base_line = base_line[:pos] + hotkeys_str + base_line[pos + len(hotkeys_str):]
-                
-                # Отрисовываем монолитную нижнюю рамку на строке h-2
-                # Она теперь сама является и границей, и панелью подсказок!
-                stdscr.addstr(h-2, 0, base_line)
-            except Exception: 
+
+                stdscr.addstr(h - 2, 0, base_line)
+            except Exception:
                 pass
-            
-            # Строку h-1 (самый низ экрана) оставляем абсолютно пустой и чистой,
-            # полностью убрав оттуда ломающие addstr/insstr вызовы
-            stdscr.refresh()
-
-
 
             stdscr.refresh()
 
-        # Маленький базовый цикл поллинга клавиш
         time.sleep(0.05)
-
 
 
 def smart_truncate_path(path: str, max_width: int) -> str:
     """
     🧠 УМНОЕ СЖАТИЕ ПУТЕЙ В СТИЛЕ NVTOP
-    Приоритет 1: Имя файла (всегда держим до конца).
-    Приоритет 2: Первая папка.
-    Приоритет 3: Вторая, третья папки. Всё, что не влезает -> '...'
     """
     if len(path) <= max_width:
         return path
@@ -359,42 +478,39 @@ def smart_truncate_path(path: str, max_width: int) -> str:
 
     current_middle = ["..."]
     for i in range(len(middle_dirs)):
-        test_middle = middle_dirs[:i+1] + ["..."]
+        test_middle = middle_dirs[:i + 1] + ["..."]
         test_path = "/".join([first_dir] + test_middle + [file_name])
         if len(test_path) <= max_width:
-            current_middle = middle_dirs[:i+1] + ["..."]
+            current_middle = middle_dirs[:i + 1] + ["..."]
         else:
             break
 
     final_path = "/".join([first_dir] + current_middle + [file_name])
     return final_path[:max_width]
 
+
 if __name__ == "__main__":
     import traceback
-    
+
     CRASH_LOG_PATH = "tui_error_crash.log"
     print("🚀 Запуск TUI-монитора в режиме глубокого перехвата ошибок...")
-    
+
     try:
-        # Пытаемся запустить стандартный curses цикл
         curses.wrapper(draw_tui)
         print("💡 Монитор завершил работу штатно (нажата клавиша Q).")
-        
+
     except Exception as root_error:
-        # Если внутри curses что-то ломается — перехватываем, 
-        # принудительно восстанавливаем терминал и пишем дамп на диск
         print("\n💥 КРИТИЧЕСКИЙ СБOЙ РАНТАЙМА TUI!")
         print(f"Ошибка: {str(root_error)}")
         print(f"Полный трейсбэк сохранен в файл: {CRASH_LOG_PATH}\n")
-        
+
         with open(CRASH_LOG_PATH, "w", encoding="utf-8") as crash_file:
             crash_file.write(f"=== TUI CRASH SNAPSHOT: {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
             crash_file.write(f"Exception Type: {type(root_error).__name__}\n")
             crash_file.write(f"Exception Message: {str(root_error)}\n\n")
             crash_file.write("--- DETAILED TRACEBACK ---\n")
             traceback.print_exc(file=crash_file)
-            
-            # Если на момент падения сервер успел отдать кэш-карту — дампим её состояние
+
             try:
                 crash_file.write("\n--- RECENT CACHE MAP STATE ---\n")
                 crash_file.write(f"Total tokens total: {total_tokens if 'total_tokens' in locals() else 'unknown'}\n")
